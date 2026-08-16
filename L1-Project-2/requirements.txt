@@ -1,0 +1,39 @@
+# ===== 智能分诊系统依赖 =====
+# 安装：pip install -r requirements.txt
+
+# ---- LLM / LangGraph ----
+langchain
+langchain-core
+langchain-openai
+langchain-chroma
+langgraph
+
+# ---- 向量库 ----
+chromadb
+
+# ---- Web 服务 ----
+fastapi
+uvicorn
+gradio
+requests
+
+# ---- 配置 ----
+pydantic
+pydantic-settings
+
+# ---- PostgreSQL ----
+psycopg2-binary
+psycopg-pool
+
+# ---- 工具 ----
+tenacity
+concurrent-log-handler
+
+# ---- 混合检索（BM25 + 中文分词）----
+rank-bm25
+jieba
+
+# ---- 重排（可选：本地 BGE-reranker，CPU 推理慢，默认关闭）----
+# 需要时手动安装（CPU 版 torch，避免拉取 2GB+ CUDA 包）：
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+#   pip install sentence-transformers

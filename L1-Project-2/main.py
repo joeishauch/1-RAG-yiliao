@@ -38,6 +38,10 @@ from ragAgent import (
     ConnectionPoolError,
     monitor_connection_pool,
 )
+from langgraph.types import Command
+from utils.privacy import desensitize
+from utils.safety import check_input_danger, check_output_diagnostic
+from utils.audit import write_audit, build_record
 
 
 # 设置LangSmith环境变量 进行应用跟踪，实时了解应用中的每一步发生了什么
@@ -80,6 +84,24 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     userId: Optional[str] = None
     conversationId: Optional[str] = None
+
+# 定义人工审核结果请求类（resume 端点）
+class ReviewRequest(BaseModel):
+    userId: str
+    conversationId: str
+    action: str                       # approve / revise / reject
+    revised_answer: Optional[str] = None
+    comment: Optional[str] = None
+    reviewer: Optional[str] = "human"
+
+# 定义待审核响应类（interrupt 命中时返回）
+class ReviewPendingResponse(BaseModel):
+    status: str = "pending_review"
+    thread_id: str
+    user_id: str
+    risk_level: Optional[str] = None
+    draft: str
+    safety_hits: List[str] = Field(default_factory=list)
 
 # 定义ChatCompletionResponseChoice类
 class ChatCompletionResponseChoice(BaseModel):
@@ -130,6 +152,17 @@ def format_response(response):
         formatted_paragraphs.append(para.strip())
     # 将所有格式化后的段落用两个换行符连接起来，以形成一个具有清晰段落分隔的文本
     return '\n\n'.join(formatted_paragraphs)
+
+
+def _extract_last_ai_content(state: dict) -> Optional[str]:
+    """逆序遍历 state 的消息，取最后一条有 content 的 AI 消息。
+
+    resume 后最终 state 里既含草稿也含审核改写，取最后一条 AI 即最终回答。
+    """
+    for m in reversed(state.get("messages", [])):
+        if getattr(m, "type", "") == "ai" and getattr(m, "content", ""):
+            return m.content
+    return None
 
 
 # 管理 FastAPI 应用生命周期的异步上下文管理器，负责启动和关闭时的初始化与清理
@@ -230,7 +263,7 @@ app = FastAPI(lifespan=lifespan)
 
 
 # 处理非流式响应的异步函数，生成并返回完整的响应内容
-async def handle_non_stream_response(user_input, graph, tool_config, config):
+async def handle_non_stream_response(user_input, graph, tool_config, config, redaction_count=0):
     """
     处理非流式响应的异步函数，生成并返回完整的响应内容。
 
@@ -245,11 +278,30 @@ async def handle_non_stream_response(user_input, graph, tool_config, config):
     """
     # 初始化 content 变量，用于存储最终响应内容
     content = None
+    # 从运行时配置提取 thread_id / user_id（审计留痕用）
+    thread_id = config["configurable"]["thread_id"]
+    user_id = config["configurable"]["user_id"]
     try:
         # 启动 graph.stream 处理用户输入，生成事件流
         events = graph.stream({"messages": [{"role": "user", "content": user_input}], "rewrite_count": 0}, config)
         # 遍历事件流中的每个事件
         for event in events:
+            # 高风险链路人工审核中断：识别 __interrupt__ 事件，返回 pending 状态
+            if "__interrupt__" in event:
+                interrupts = event["__interrupt__"]
+                payload = interrupts[0].value if interrupts else {}
+                write_audit(build_record(
+                    event="draft", thread_id=thread_id, user_id=user_id,
+                    risk_level=payload.get("risk_level"), draft=payload.get("draft"),
+                    redacted=redaction_count > 0, redaction_count=redaction_count,
+                ))
+                return JSONResponse(content=ReviewPendingResponse(
+                    thread_id=thread_id,
+                    user_id=user_id,
+                    risk_level=payload.get("risk_level"),
+                    draft=payload.get("draft", ""),
+                    safety_hits=payload.get("safety_hits", []),
+                ).model_dump())
             # 遍历事件中的所有值
             for value in event.values():
                 # 检查事件值是否包含有效消息列表
@@ -296,6 +348,18 @@ async def handle_non_stream_response(user_input, graph, tool_config, config):
     except Exception as e:
         # 捕获并记录其他未预期的异常
         logger.error(f"Error processing response: {e}")
+
+    # 出口诊断性表述检测：命中则追加安全提示
+    if content:
+        diag_hint = check_output_diagnostic(content)
+        if diag_hint:
+            content = content + "\n\n" + diag_hint
+
+    # 审计：记录最终回答（低/中风险直出，或高风险未开启审核时）
+    write_audit(build_record(
+        event="final", thread_id=thread_id, user_id=user_id, final_answer=content,
+        redacted=redaction_count > 0, redaction_count=redaction_count,
+    ))
 
     # 格式化响应内容，若无内容则返回默认值
     formatted_response = str(format_response(content)) if content else "No response generated"
@@ -383,6 +447,17 @@ async def handle_stream_response(user_input, graph, config):
                     logger.error(f"Error processing stream chunk: {chunk_error}")
                     continue
 
+            # 流结束：兜底检测是否有未处理的中断（HITL），有则产出 pending 事件（完整流式 HITL 归二期）
+            try:
+                graph_state = graph.get_state(config)
+                interrupts = getattr(graph_state, "interrupts", None)
+                if interrupts:
+                    payload = interrupts[0].value if interrupts else {}
+                    yield f"data: {json.dumps({'status': 'pending_review', 'thread_id': config['configurable']['thread_id'], 'risk_level': payload.get('risk_level'), 'draft': payload.get('draft', '')})}\n\n"
+                    return
+            except Exception:
+                pass
+
             # 产出流结束标记
             yield f"data: {json.dumps({'id': chunk_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
         except Exception as stream_error:
@@ -430,6 +505,28 @@ async def chat_completions(request: ChatCompletionRequest, dependencies: Tuple[a
         user_input = request.messages[-1].content
         logger.info(f"The user's user_input is: {user_input}")
 
+        # 入口脱敏：PII 永不进入持久化记忆/提示词/审计日志
+        user_input, redaction_count = desensitize(user_input)
+
+        # 入口危险信号拦截（脱敏后文本，危险词不受脱敏影响；不进图）
+        blocked = check_input_danger(user_input)
+        if blocked:
+            write_audit(build_record(
+                event="block",
+                thread_id=f"{getattr(request, 'userId', 'unknown')}@@{getattr(request, 'conversationId', 'default')}",
+                user_id=getattr(request, 'userId', 'unknown'),
+                user_input=user_input,
+                redacted=redaction_count > 0,
+                redaction_count=redaction_count,
+            ))
+            return JSONResponse(content=ChatCompletionResponse(
+                choices=[ChatCompletionResponseChoice(
+                    index=0,
+                    message=Message(role="assistant", content=blocked),
+                    finish_reason="stop",
+                )]
+            ).model_dump())
+
         # 定义运行时配置，包含线程ID和用户ID，使用默认值防止未定义
         config = {
             "configurable": {
@@ -442,10 +539,56 @@ async def chat_completions(request: ChatCompletionRequest, dependencies: Tuple[a
         if request.stream:
             return await handle_stream_response(user_input, graph, config)
         # 调用非流式输出
-        return await handle_non_stream_response(user_input, graph, tool_config, config)
+        return await handle_non_stream_response(user_input, graph, tool_config, config, redaction_count=redaction_count)
 
     except Exception as e:
         logger.error(f"Error handling chat completion:\n\n {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/v1/chat/review")
+async def review_resume(request: ReviewRequest, dependencies: Tuple[any, any] = Depends(get_dependencies)):
+    """接收医生审核结果，用 Command(resume=...) 续跑中断的图，返回最终回答。"""
+    try:
+        graph, tool_config = dependencies
+        thread_id = f"{request.userId}@@{request.conversationId}"
+        config = {"configurable": {"thread_id": thread_id, "user_id": request.userId}}
+        decision = {
+            "action": request.action,
+            "revised_answer": request.revised_answer,
+            "comment": request.comment,
+            "reviewer": request.reviewer,
+        }
+
+        # 续跑：无需重传 input，checkpoint 已存 state；返回最终 state
+        final_state = graph.invoke(Command(resume=decision), config)
+        final_content = _extract_last_ai_content(final_state)
+
+        # 出口诊断性表述检测
+        if final_content:
+            diag_hint = check_output_diagnostic(final_content)
+            if diag_hint:
+                final_content = final_content + "\n\n" + diag_hint
+
+        write_audit(build_record(
+            event="review_decision", thread_id=thread_id, user_id=request.userId,
+            action=request.action, revised_answer=request.revised_answer,
+            reviewer=request.reviewer, comment=request.comment,
+        ))
+        write_audit(build_record(
+            event="final", thread_id=thread_id, user_id=request.userId,
+            final_answer=final_content,
+        ))
+
+        return JSONResponse(content=ChatCompletionResponse(
+            choices=[ChatCompletionResponseChoice(
+                index=0,
+                message=Message(role="assistant", content=final_content or Config.REVIEW_REJECT_FALLBACK),
+                finish_reason="stop",
+            )]
+        ).model_dump())
+    except Exception as e:
+        logger.error(f"Error handling review resume: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 

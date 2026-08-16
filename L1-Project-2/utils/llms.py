@@ -1,7 +1,10 @@
+ # 模型配置测试
 import os
 import logging
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+from utils.config import settings
 
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -10,20 +13,20 @@ logger = logging.getLogger(__name__)
 # 模型配置字典
 MODEL_CONFIGS = {
     "openai": {
-        "base_url": os.getenv("OPENAI_BASE_URL"),
-        "api_key": os.getenv("OPENAI_API_KEY"),
+        "base_url": settings.OPENAI_BASE_URL,
+        "api_key": settings.OPENAI_API_KEY,
         "chat_model": "gpt-4o",
         "embedding_model": "text-embedding-3-small"
     },
     "qwen": {
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "api_key": os.getenv("DASHSCOPE_API_KEY"),
+        "api_key": settings.DASHSCOPE_API_KEY,
         "chat_model": "qwen-max",
         "embedding_model": "text-embedding-v1"
     },
     "oneapi": {
         "base_url": "http://139.224.72.218:3000/v1",
-        "api_key": os.getenv("DASHSCOPE_API_KEY"),
+        "api_key": settings.DASHSCOPE_API_KEY,
         "chat_model": "qwen-max",
         "embedding_model": "text-embedding-v1"
     },
@@ -34,18 +37,18 @@ MODEL_CONFIGS = {
         "embedding_model": "bge-m3:latest"
     },
     "deepseek": {
-        "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
-        "api_key": os.getenv("DEEPSEEK_API_KEY"),
-        "chat_model": os.getenv("DEEPSEEK_MODEL", "deepseek-chat"),
+        "base_url": settings.DEEPSEEK_BASE_URL,
+        "api_key": settings.DEEPSEEK_API_KEY,
+        "chat_model": settings.DEEPSEEK_MODEL,
         "embedding_model": "text-embedding-v1",
         "embedding_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-        "embedding_api_key": os.getenv("DASHSCOPE_API_KEY")
+        "embedding_api_key": settings.DASHSCOPE_API_KEY
     }
 }
 
 # 默认配置
-DEFAULT_LLM_TYPE = "deepseek"
-DEFAULT_TEMPERATURE = 0.0
+DEFAULT_LLM_TYPE = "deepseek" # 设置默认模型
+DEFAULT_TEMPERATURE = 0.0 # 参数越低，幻觉越小
 
 
 class LLMInitializationError(Exception):
@@ -85,8 +88,8 @@ def initialize_llm(llm_type: str = DEFAULT_LLM_TYPE) -> tuple[ChatOpenAI, OpenAI
             api_key=api_key,
             model=config["chat_model"],
             temperature=DEFAULT_TEMPERATURE,
-            timeout=30,
-            max_retries=2
+            timeout=30, # 添加超时配置
+            max_retries=2 # 添加重试次数
         )
 
         embedding_base_url = config.get("embedding_base_url", config["base_url"])

@@ -24,9 +24,10 @@ from langgraph.graph.message import add_messages
 # 导入预构建的工具条件和工具节点
 from langgraph.prebuilt import tools_condition, ToolNode
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from langchain_core.messages import ToolMessage
+from langchain_core.messages import ToolMessage, AIMessage
 # 导入状态图和起始/结束节点的定义
 from langgraph.graph import StateGraph, START, END
+from langgraph.types import interrupt
 # 导入基础存储接口
 from langgraph.store.base import BaseStore
 # 导入可运行配置类
@@ -45,9 +46,10 @@ from pydantic import BaseModel, Field
 # 导入自定义的get_llm函数，用于获取LLM模型
 from utils.llms import get_llm
 # 导入工具配置模块
-from utils.tools_config import get_tools
+from utils.tools_config import get_tools, get_triage_context, triage_rank, CONSULT_TOP_N, CONSULT_TOP_K
 # 导入统一的 Config 类
 from utils.config import Config
+from utils.safety import safety_flags
 
 # # 设置日志基本配置，级别为DEBUG或INFO
 logger = logging.getLogger(__name__)
@@ -76,12 +78,14 @@ logger.addHandler(handler)
 class MessagesState(TypedDict):
     # 定义messages字段，类型为消息序列，使用add_messages处理追加
     messages: Annotated[Sequence[BaseMessage], add_messages]
-    # 定义relevance_score字段，用于存储文档相关性评分
-    relevance_score: Annotated[Optional[str], "Relevance score of retrieved documents, 'yes' or 'no'"]
-    # 定义rewrite_count字段，用于跟踪问题重写的次数，达到次数退出graph的递归循环
-    rewrite_count: Annotated[int, "Number of times query has been rewritten"]
+    # 各科室会诊意见（consult 节点写入，summarize 节点读取）
+    consultations: list
+    # 风险等级（各 generate 节点写入）：high / medium / low
+    risk_level: Optional[str]
+    # 审核状态（review 节点写入）：auto_approved / approved / revised / rejected
+    review_status: Optional[str]
 
-# 定义工具配置管理类，用于管理工具及其路由配置
+# 定义工具配置管理类，用于管理工具列表与名称（路由由 route_after_tools 负责）
 class ToolConfig:
     # 初始化方法，接收工具列表并设置相关属性
     def __init__(self, tools):
@@ -89,37 +93,8 @@ class ToolConfig:
         self.tools = tools
         # 创建一个集合，包含所有工具的名称，使用集合推导式从 tools 中提取 name 属性
         self.tool_names = {tool.name for tool in tools}
-        # 调用内部方法 _build_routing_config，动态生成工具路由配置并存储到 self.tool_routing_config
-        self.tool_routing_config = self._build_routing_config(tools)
-        # 记录日志，输出初始化完成的工具名称集合和路由配置，便于调试和验证
-        logger.info(f"Initialized ToolConfig with tools: {self.tool_names}, routing: {self.tool_routing_config}")
-
-    # 内部方法，用于根据工具定义动态构建路由配置
-    def _build_routing_config(self, tools):
-        # 创建一个空字典，用于存储工具名称到目标节点的映射
-        routing_config = {}
-        # 遍历传入的工具列表，逐个处理每个工具
-        for tool in tools:
-            # 将工具名称转换为小写，确保匹配时忽略大小写
-            tool_name = tool.name.lower()
-            # 检查工具名称中是否包含 "retrieve"，用于判断是否为检索类工具
-            if "retrieve" in tool_name:
-                # 如果是检索类工具，将其路由目标设置为 "grade_documents"（需要评分）
-                routing_config[tool_name] = "grade_documents"
-                # 记录调试日志，说明该工具被路由到 "grade_documents"，并标注为检索工具
-                logger.debug(f"Tool '{tool_name}' routed to 'grade_documents' (retrieval tool)")
-            # 如果工具名称不包含 "retrieve"
-            else:
-                # 将其路由目标设置为 "generate"（直接生成结果）
-                routing_config[tool_name] = "generate"
-                # 记录调试日志，说明该工具被路由到 "generate"，并标注为非检索工具
-                logger.debug(f"Tool '{tool_name}' routed to 'generate' (non-retrieval tool)")
-        # 检查路由配置字典是否为空（即没有工具被处理）
-        if not routing_config:
-            # 如果为空，记录警告日志，提示工具列表可能为空或未正确处理
-            logger.warning("No tools provided or routing config is empty")
-        # 返回生成的路由配置字典
-        return routing_config
+        # 记录日志，输出初始化完成的工具名称集合
+        logger.info(f"Initialized ToolConfig with tools: {self.tool_names}")
 
     # 获取工具列表的方法，返回存储在实例中的 tools
     def get_tools(self):
@@ -130,16 +105,6 @@ class ToolConfig:
     def get_tool_names(self):
         # 直接返回 self.tool_names，提供外部访问工具名称集合的接口
         return self.tool_names
-
-    # 获取工具路由配置的方法，返回动态生成的路由配置
-    def get_tool_routing_config(self):
-        # 直接返回 self.tool_routing_config，提供外部访问路由配置的接口
-        return self.tool_routing_config
-
-# 文档相关性评分
-class DocumentRelevanceScore(BaseModel):
-    # 定义binary_score字段，表示相关性评分，取值为"yes"或"no"
-    binary_score: str = Field(description="Relevance score 'yes' or 'no'")
 
 # 自定义异常，表示数据库连接池初始化或状态异常
 class ConnectionPoolError(Exception):
@@ -436,241 +401,258 @@ def agent(state: MessagesState, config: RunnableConfig, *, store: BaseStore, llm
         return {"messages": [{"role": "system", "content": "处理请求时出错"}]}
 
 
-# 定义 Node grade_documents相关性评估函数
-def grade_documents(state: MessagesState, llm_chat) -> dict:
-    """评估检索到的文档内容与问题的相关性，并将评分结果存储在状态中。
+# 定义单科室会诊评估函数（consult 节点内部并行调用）
+def _consult_one(label: str, question: str, llm_chat, vectorstore) -> str:
+    """从单个科室的专科视角评估主诉，返回该科室的会诊意见。
 
     Args:
-        state: 当前对话状态，包含消息历史。
+        label: 科室名。
+        question: 患者主诉。
+        llm_chat: Chat 模型。
+        vectorstore: Chroma 向量存储。
 
     Returns:
-        dict: 更新后的状态，包含评分结果。
+        str: 该科室的会诊意见（含可能性 + 依据）。
     """
-    logger.info("Grading documents for relevance")
-    if not state.get("messages"):
-        logger.error("Messages state is empty")
-        return {
-            "messages": [{"role": "system", "content": "状态为空，无法评分"}],
-            "relevance_score": None
-        }
-
     try:
-        # # 获取用户的最新问题
-        question = get_latest_question(state)
-        # 获取最后一条消息作为上下文(因为调用工具输出的内容写入到state的最新消息中)
-        context = state["messages"][-1].content
-        # logger.info(f"Evaluating relevance - Question: {question}, Context: {context}")
+        # 按科室过滤检索：只取该科室 label 下的相似病例
+        docs = vectorstore.similarity_search(question, k=CONSULT_TOP_K, filter={"label": label})
+        context = "\n".join(
+            f"- {d.metadata.get('answer', '')[:80]}"
+            for d in docs
+        ) or "无相关病例"
 
-        # 创建评分处理链（不使用结构化输出，因为DeepSeek不支持）
-        grade_chain = create_chain(llm_chat, Config.PROMPT_TEMPLATE_TXT_GRADE)
-        # 调用评分链评估相关性
-        scored_result = grade_chain.invoke({"question": question, "context": context})
-        # 解析纯文本响应
-        score = str(scored_result).strip().lower() if scored_result else "no"
-        # 确保评分结果是有效的 yes/no
-        if score not in ["yes", "no"]:
-            score = "yes" if "yes" in str(scored_result).lower() else "no"
-        logger.info(f"Document relevance score: {score}")
-
-        # 返回更新后的状态，包括评分结果
-        return {
-            # 保持消息不变
-            "messages": state["messages"],
-            # 存储评分结果
-            "relevance_score": score
-        }
-    except (IndexError, KeyError) as e:
-        logger.error(f"Message access error: {e}")
-        return {
-            "messages": [{"role": "system", "content": "无法评分文档"}],
-            "relevance_score": None
-        }
+        consult_chain = create_chain(llm_chat, Config.PROMPT_TEMPLATE_TXT_CONSULT)
+        response = consult_chain.invoke({
+            "department": label,
+            "question": question,
+            "context": context,
+        })
+        content = response.content if hasattr(response, "content") else str(response)
+        return f"【{label}】\n{content.strip()}"
     except Exception as e:
-        logger.error(f"Unexpected error in grading: {e}")
-        return {
-            "messages": [{"role": "system", "content": "评分过程中出错"}],
-            "relevance_score": None
-        }
+        logger.error(f"Error in _consult_one for {label}: {e}")
+        return f"【{label}】\n评估失败：{e}"
 
 
-# 查询重写
-def rewrite(state: MessagesState, llm_chat) -> dict:
-    """重写用户查询以改进问题。
+# 定义Node 会诊函数：识别 Top-N 科室后并行专科评估
+def consult(state: MessagesState, llm_chat, llm_embedding) -> dict:
+    """会诊节点：并行启动多个专科视角评估。
 
     Args:
         state: 当前对话状态。
+        llm_chat: Chat 模型。
+        llm_embedding: Embedding 模型（用于获取分诊上下文）。
+
+    Returns:
+        dict: 含各科室会诊意见的更新状态。
+    """
+    # 记录开始会诊
+    logger.info("Consulting multiple departments")
+    try:
+        question = get_latest_question(state)
+        vectorstore, prior_counter, prior_total, hybrid = get_triage_context(llm_embedding)
+
+        # 第一层分诊：混合检索拿到结构化的 Top-N 科室
+        top_labels = triage_rank(hybrid, prior_counter, prior_total, question, top_n=CONSULT_TOP_N)
+        if not top_labels:
+            return {"consultations": []}
+
+        labels = [label for label, _, _ in top_labels]
+        logger.info(f"Consulting departments: {labels}")
+
+        # 并行专科评估
+        opinions = []
+        with ThreadPoolExecutor(max_workers=CONSULT_TOP_N) as executor:
+            future_to_label = {
+                executor.submit(_consult_one, label, question, llm_chat, vectorstore): label
+                for label in labels
+            }
+            for future in as_completed(future_to_label):
+                try:
+                    opinions.append(future.result())
+                except Exception as e:
+                    logger.error(f"Consult future failed: {e}")
+                    opinions.append(f"【{future_to_label[future]}】\n评估失败")
+
+        return {"consultations": opinions}
+    except Exception as e:
+        logger.error(f"Error in consult: {e}")
+        return {"consultations": []}
+
+
+# 定义Node 会诊汇总函数
+def summarize(state: MessagesState, llm_chat) -> dict:
+    """汇总各科室会诊意见，生成最终分诊建议。
+
+    Args:
+        state: 当前对话状态。
+        llm_chat: Chat 模型。
 
     Returns:
         dict: 更新后的消息状态。
     """
-    # 记录开始重写查询
-    logger.info("Rewriting query")
-    # 尝试执行以下代码块
+    # 记录开始汇总会诊结果
+    logger.info("Summarizing consultation results")
     try:
         # 获取用户的最新问题
         question = get_latest_question(state)
-        # 创建重写处理链
-        rewrite_chain = create_chain(llm_chat, Config.PROMPT_TEMPLATE_TXT_REWRITE)
-        # 调用重写链生成新查询
-        response = rewrite_chain.invoke({"question": question})
-        # logger.info(f"rewrite question:{response}")
-        # 重写次数+1
-        rewrite_count = state.get("rewrite_count", 0) + 1
-        logger.info(f"Rewrite count: {rewrite_count}")
-        # 返回更新后的对话状态
-        return {"messages": [response], "rewrite_count": rewrite_count}
+        # 第一层候选科室分布（retrieve 工具返回的字符串，仍在 messages 末尾）
+        first_pass = state["messages"][-1].content
+        # 各科室会诊意见
+        consultations = state.get("consultations", [])
+        consultations_text = "\n\n".join(consultations) if consultations else "（无会诊意见）"
+
+        # 创建汇总处理链
+        summarize_chain = create_chain(llm_chat, Config.PROMPT_TEMPLATE_TXT_SUMMARIZE)
+        # 调用汇总链生成最终分诊建议
+        response = summarize_chain.invoke({
+            "question": question,
+            "first_pass": first_pass,
+            "consultations": consultations_text,
+        })
+        # 返回更新后的消息状态（分诊建议属高风险，需人工审核）
+        return {"messages": [response], "risk_level": "high"}
     # 捕获索引或键错误
     except (IndexError, KeyError) as e:
         # 记录错误日志
-        logger.error(f"Message access error in rewrite: {e}")
+        logger.error(f"Message access error in summarize: {e}")
         # 返回错误消息
-        return {"messages": [{"role": "system", "content": "无法重写查询"}]}
+        return {"messages": [{"role": "system", "content": "无法生成会诊结论"}]}
 
 
-# 定义Node 生成回复函数
-def generate(state: MessagesState, llm_chat) -> dict:
-    """基于工具返回的内容生成最终回复。
+def route_after_tools(state: MessagesState) -> str:
+    """工具执行后的路由：区分分诊检索、知识图谱推理与科普问答。
 
-    Args:
-        state: 当前对话状态。
+    分诊场景调用 retrieve → 进入会诊链路（consult → summarize）；
+    知识图谱场景调用 kg_query → 进入知识图谱回答节点（generate_kg）；
+    科普场景调用 medical_qa → 进入科普回答节点（generate_qa）；
+    药物禁忌场景调用 drug_taboo → 进入药物禁忌回答节点（generate_drug）。
 
     Returns:
-        dict: 更新后的消息状态。
+        str: 下一个节点名（"consult" / "generate_kg" / "generate_qa" / "generate_drug" / END）
     """
-    # 记录开始生成回复
-    logger.info("Generating final response")
-    # 尝试执行以下代码块
+    # 从后向前找最后一个带工具调用的 AIMessage，据此判断本次执行了哪些工具
+    for msg in reversed(state["messages"]):
+        if msg.__class__.__name__ == "AIMessage" and getattr(msg, "tool_calls", None):
+            names = {tc["name"] for tc in msg.tool_calls if isinstance(tc, dict) and "name" in tc}
+            if "retrieve" in names:
+                return "consult"
+            if "kg_query" in names:
+                return "generate_kg"
+            if "drug_taboo" in names:
+                return "generate_drug"
+            return "generate_qa"
+    return END
+
+
+def generate_qa(state: MessagesState, llm_chat) -> dict:
+    """科普回答节点：基于 medical_qa 检索到的医学知识，用 LLM 生成自然、易懂的科普答案。
+
+    Args:
+        state: 当前对话状态（messages 末尾为 medical_qa 工具的检索结果）。
+        llm_chat: Chat 模型。
+
+    Returns:
+        dict: 含最终科普答案的消息状态。
+    """
+    # 记录开始生成科普回答
+    logger.info("Generating medical QA answer")
     try:
-        # 获取用户的最新问题
+        # 获取用户最新问题
         question = get_latest_question(state)
-        # 获取最后一条消息作为上下文(因为调用工具输出的内容写入到state的最新消息中)
+        # call_tools 之后最后一条消息是 medical_qa 工具的检索结果
         context = state["messages"][-1].content
-        # logger.info(f"generate - Question: {question}, Context: {context}")
-        # 创建生成处理链
-        generate_chain = create_chain(llm_chat, Config.PROMPT_TEMPLATE_TXT_GENERATE)
-        # 调用生成链生成回复
-        response = generate_chain.invoke({"context": context, "question": question})
-        # 返回更新后的消息状态
-        return {"messages": [response]}
-    # 捕获索引或键错误
+        # 创建科普回答链
+        qa_chain = create_chain(llm_chat, Config.PROMPT_TEMPLATE_TXT_QA)
+        # 调用回答链生成自然答案
+        response = qa_chain.invoke({"question": question, "context": context})
+        return {"messages": [response], "risk_level": "low"}
     except (IndexError, KeyError) as e:
-        # 记录错误日志
-        logger.error(f"Message access error in generate: {e}")
-        # 返回错误消息
-        return {"messages": [{"role": "system", "content": "无法生成回复"}]}
+        logger.error(f"Message access error in generate_qa: {e}")
+        return {"messages": [{"role": "system", "content": "无法生成回答"}]}
 
 
-# 定义Edge 根据工具调用的结果动态决定下一步路由
-def route_after_tools(state: MessagesState, tool_config: ToolConfig) -> Literal["generate", "grade_documents"]:
-    """
-    根据工具调用的结果动态决定下一步路由，使用配置字典支持多工具并包含容错处理。
+def generate_kg(state: MessagesState, llm_chat) -> dict:
+    """知识图谱回答节点：基于 kg_query 推理结果，用 LLM 生成自然、易懂的疾病方向解释。
 
     Args:
-        state: 当前对话状态，包含消息历史和可能的工具调用结果。
-        tool_config: 工具配置参数。
+        state: 当前对话状态（messages 末尾为 kg_query 工具的推理结果）。
+        llm_chat: Chat 模型。
 
     Returns:
-        Literal["generate", "grade_documents"]: 下一步的目标节点。
+        dict: 含最终回答的消息状态。
     """
-    # 检查状态是否包含消息列表，若为空则记录错误并默认路由到 generate
-    if not state.get("messages") or not isinstance(state["messages"], list):
-        logger.error("Messages state is empty or invalid, defaulting to generate")
-        return "generate"
-
+    logger.info("Generating KG-based answer")
     try:
-        # 获取状态中的最后一条消息，用于判断工具调用来源
-        last_message = state["messages"][-1]
-
-        # 检查消息是否具有 name 属性，若无则路由到 generate
-        if not hasattr(last_message, "name") or last_message.name is None:
-            logger.info("Last message has no name attribute, routing to generate")
-            return "generate"
-
-        # 检查消息是否来自已注册的工具
-        tool_name = last_message.name
-        if tool_name not in tool_config.get_tool_names():
-            logger.info(f"Unknown tool {tool_name}, routing to generate")
-            return "generate"
-
-        # 根据配置字典决定路由，若无配置则默认路由到 generate
-        target = tool_config.get_tool_routing_config().get(tool_name, "generate")
-        logger.info(f"Tool {tool_name} routed to {target} based on config")
-        return target
-
-    except IndexError:
-        # 捕获消息列表为空或索引错误的异常，记录错误并默认路由到 generate
-        logger.error("No messages available in state, defaulting to generate")
-        return "generate"
-    except AttributeError:
-        # 捕获消息对象属性访问错误的异常，记录错误并默认路由到 generate
-        logger.error("Invalid message object, defaulting to generate")
-        return "generate"
-    except Exception as e:
-        # 捕获其他未预期的异常，记录详细错误信息并默认路由到 generate
-        logger.error(f"Unexpected error in route_after_tools: {e}, defaulting to generate")
-        return "generate"
+        question = get_latest_question(state)
+        context = state["messages"][-1].content
+        kg_chain = create_chain(llm_chat, Config.PROMPT_TEMPLATE_TXT_KG)
+        response = kg_chain.invoke({"question": question, "context": context})
+        return {"messages": [response], "risk_level": "medium"}
+    except (IndexError, KeyError) as e:
+        logger.error(f"Message access error in generate_kg: {e}")
+        return {"messages": [{"role": "system", "content": "无法生成回答"}]}
 
 
-# 定义Edge 根据状态中的评分结果决定下一步路由
-def route_after_grade(state: MessagesState) -> Literal["generate", "rewrite"]:
-    """
-    根据状态中的评分结果决定下一步路由，包含增强的状态校验和容错处理。
+def generate_drug(state: MessagesState, llm_chat) -> dict:
+    """药物禁忌回答节点：基于 drug_taboo 查询到的禁忌信息，用 LLM 生成自然、通俗的用药安全回答。
 
     Args:
-        state: 当前对话状态，预期包含 messages 和 relevance_score 字段。
+        state: 当前对话状态（messages 末尾为 drug_taboo 工具的禁忌查询结果）。
+        llm_chat: Chat 模型。
 
     Returns:
-        Literal["generate", "rewrite"]: 下一步的目标节点。
+        dict: 含最终药物禁忌回答的消息状态。
     """
-    # 检查状态是否为有效字典，若无效则记录错误并默认路由到 rewrite
-    if not isinstance(state, dict):
-        logger.error("State is not a valid dictionary, defaulting to rewrite")
-        return "rewrite"
-
-    # 检查状态是否包含 messages 字段，若缺失则记录错误并默认路由到 rewrite
-    if "messages" not in state or not isinstance(state["messages"], (list, tuple)):
-        logger.error("State missing valid messages field, defaulting to rewrite")
-        return "rewrite"
-
-    # 检查 messages 是否为空，若为空则记录警告并默认路由到 rewrite
-    if not state["messages"]:
-        logger.warning("Messages list is empty, defaulting to rewrite")
-        return "rewrite"
-
-    # 获取状态中的 relevance_score，若不存在则返回 None
-    relevance_score = state.get("relevance_score")
-    # 获取状态中的 rewrite_count
-    rewrite_count = state.get("rewrite_count", 0)
-    logger.info(f"Routing based on relevance_score: {relevance_score}, rewrite_count: {rewrite_count}")
-
-    # 如果重写次数超过 3 次，强制路由到 generate
-    if rewrite_count >= 3:
-        logger.info("Max rewrite limit reached, proceeding to generate")
-        return "generate"
-
+    logger.info("Generating drug taboo answer")
     try:
-        # 检查 relevance_score 是否为有效字符串，若不是则视为无效评分
-        if not isinstance(relevance_score, str):
-            logger.warning(f"Invalid relevance_score type: {type(relevance_score)}, defaulting to rewrite")
-            return "rewrite"
+        question = get_latest_question(state)
+        context = state["messages"][-1].content
+        drug_chain = create_chain(llm_chat, Config.PROMPT_TEMPLATE_TXT_DRUG)
+        response = drug_chain.invoke({"question": question, "context": context})
+        return {"messages": [response], "risk_level": "high"}
+    except (IndexError, KeyError) as e:
+        logger.error(f"Message access error in generate_drug: {e}")
+        return {"messages": [{"role": "system", "content": "无法生成回答"}]}
 
-        # 如果评分结果为 "yes"，表示文档相关，路由到 generate 节点
-        if relevance_score.lower() == "yes":
-            logger.info("Documents are relevant, proceeding to generate")
-            return "generate"
 
-        # 如果评分结果为 "no" 或其他值（包括空字符串），路由到 rewrite 节点
-        logger.info("Documents are not relevant or scoring failed, proceeding to rewrite")
-        return "rewrite"
+# 定义 Node 高风险人工审核函数（HITL）
+def review(state: MessagesState, config: RunnableConfig) -> dict:
+    """高风险链路人工审核：summarize / generate_drug 之后触发。
 
-    except AttributeError:
-        # 捕获 relevance_score 不支持 lower() 方法的异常（例如 None），默认路由到 rewrite
-        logger.error("relevance_score is not a string or is None, defaulting to rewrite")
-        return "rewrite"
-    except Exception as e:
-        # 捕获其他未预期的异常，记录详细错误信息并默认路由到 rewrite
-        logger.error(f"Unexpected error in route_after_grade: {e}, defaulting to rewrite")
-        return "rewrite"
+    幂等要求：interrupt 之前零副作用；草稿从 state 读取，绝不重跑 LLM
+    （resume 会从节点开头重跑，重跑 LLM 会导致非确定 + 双倍成本 + 前后不一致）。
+    """
+    # 上一节点 AI 草稿（summarize/generate_drug 已把草稿写进 state 并经 checkpoint）
+    draft = state["messages"][-1].content
+    risk_level = state.get("risk_level", "")
+
+    # 审核开关：config 覆盖 > .env 配置；关闭时自动放行（开发/demo 直跑用）
+    hitl_enabled = config.get("configurable", {}).get("hitl_enabled", Config.HITL_ENABLED)
+    if not hitl_enabled:
+        logger.info("HITL 已关闭，自动放行")
+        return {"review_status": "auto_approved"}
+
+    # 中断等待人工审核；payload 必须 JSON 可序列化（过 checkpoint serde）
+    decision = interrupt({
+        "draft": draft,
+        "risk_level": risk_level,
+        "safety_hits": safety_flags(draft),
+    })
+
+    action = (decision or {}).get("action", "reject")
+    revised = (decision or {}).get("revised_answer") or ""
+    if action == "approve":
+        return {"review_status": "approved"}
+    if action == "revise":
+        # 改写：追加新 AIMessage（边界按最后一条 AI 取内容时以改写版为准）
+        return {"review_status": "revised", "messages": [AIMessage(content=revised)]}
+    # reject：拦截，返回拒答兜底文案（有改写文本则用改写文本，否则用配置兜底）
+    return {
+        "review_status": "rejected",
+        "messages": [AIMessage(content=revised or Config.REVIEW_REJECT_FALLBACK)],
+    }
 
 
 # 保存状态图的可视化表示
@@ -757,25 +739,41 @@ def create_graph(db_connection_pool: ConnectionPool, llm_chat, llm_embedding, to
     workflow.add_node("agent", lambda state, config: agent(state, config, store=store, llm_chat=llm_chat, tool_config=tool_config))
     # 添加工具节点，使用并行工具节点
     workflow.add_node("call_tools", ParallelToolNode(tool_config.get_tools(), max_workers=5))
-    # 添加重写节点
-    workflow.add_node("rewrite", lambda state: rewrite(state,llm_chat=llm_chat))
-    # 添加生成节点
-    workflow.add_node("generate", lambda state: generate(state, llm_chat=llm_chat))
-    # 添加文档相关性评分节点
-    workflow.add_node("grade_documents", lambda state: grade_documents(state, llm_chat=llm_chat))
+    # 添加会诊节点：识别 Top-N 科室后并行专科评估
+    workflow.add_node("consult", lambda state: consult(state, llm_chat=llm_chat, llm_embedding=llm_embedding))
+    # 添加汇总节点：综合各科室会诊意见生成最终分诊建议
+    workflow.add_node("summarize", lambda state: summarize(state, llm_chat=llm_chat))
+    # 添加科普回答节点：基于 medical_qa 检索结果生成自然科普答案
+    workflow.add_node("generate_qa", lambda state: generate_qa(state, llm_chat=llm_chat))
+    # 添加知识图谱回答节点：基于 kg_query 推理结果生成疾病方向解释
+    workflow.add_node("generate_kg", lambda state: generate_kg(state, llm_chat=llm_chat))
+    # 添加药物禁忌回答节点：基于 drug_taboo 查询结果生成用药安全回答
+    workflow.add_node("generate_drug", lambda state: generate_drug(state, llm_chat=llm_chat))
+    # 添加高风险人工审核节点（summarize / generate_drug 之后触发）
+    workflow.add_node("review", lambda state, config: review(state, config))
 
     # 添加从起始到代理的边
     workflow.add_edge(START, end_key="agent")
-    # 添加代理的条件边，根据工具调用的工具名称决定下一步路由
+    # 添加代理的条件边：LLM 决定是否调用工具；不调用则直接结束（agent 节点直接回答）
     workflow.add_conditional_edges(source="agent", path=tools_condition, path_map={"tools": "call_tools", END: END})
-    # 添加检索的条件边，根据工具调用的结果动态决定下一步路由
-    workflow.add_conditional_edges(source="call_tools", path=lambda state: route_after_tools(state, tool_config),path_map={"generate": "generate", "grade_documents": "grade_documents"})
-    # 添加检索的条件边，根据状态中的评分结果决定下一步路由
-    workflow.add_conditional_edges(source="grade_documents", path=route_after_grade, path_map={"generate": "generate", "rewrite": "rewrite"})
-    # 添加从生成到结束的边
-    workflow.add_edge(start_key="generate", end_key=END)
-    # 添加从重写到代理的边
-    workflow.add_edge(start_key="rewrite", end_key="agent")
+    # 工具执行后按工具名路由：分诊 retrieve → 会诊；知识图谱 kg_query → 生成推理回答；科普 medical_qa → 生成回答；药物禁忌 drug_taboo → 生成用药安全回答
+    workflow.add_conditional_edges(
+        source="call_tools",
+        path=route_after_tools,
+        path_map={"consult": "consult", "generate_kg": "generate_kg", "generate_qa": "generate_qa", "generate_drug": "generate_drug", END: END},
+    )
+    # 会诊完成后汇总
+    workflow.add_edge(start_key="consult", end_key="summarize")
+    # 汇总后进入高风险审核（分诊建议属高风险，需人工确认）
+    workflow.add_edge(start_key="summarize", end_key="review")
+    # 科普回答后结束
+    workflow.add_edge(start_key="generate_qa", end_key=END)
+    # 知识图谱回答后结束
+    workflow.add_edge(start_key="generate_kg", end_key=END)
+    # 药物禁忌回答后进入高风险审核（用药禁忌属高风险，需人工确认）
+    workflow.add_edge(start_key="generate_drug", end_key="review")
+    # 审核后结束
+    workflow.add_edge(start_key="review", end_key=END)
 
     # 编译状态图，绑定检查点和存储
     return workflow.compile(checkpointer=checkpointer, store=store)
@@ -792,14 +790,14 @@ def graph_response(graph: StateGraph, user_input: str, config: dict, tool_config
     """
     try:
         # 启动状态图流处理用户输入
-        events = graph.stream({"messages": [{"role": "user", "content": user_input}], "rewrite_count": 0}, config)
+        events = graph.stream({"messages": [{"role": "user", "content": user_input}]}, config)
         # 遍历事件流
         for event in events:
             # 遍历事件中的值
             for value in event.values():
                 # 检查是否有有效消息
                 if "messages" not in value or not isinstance(value["messages"], list):
-                    logger.warning("No valid messages in response")
+                    # 中间节点（如 consult）只返回 consultations 等非 messages 字段，静默跳过
                     continue
 
                 # 获取最后一条消息

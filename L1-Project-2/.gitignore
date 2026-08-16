@@ -1,0 +1,32 @@
+# 环境变量（含敏感 API key，绝不提交）
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# 向量库二进制（大文件）
+chromaDB/
+
+# 知识图谱缓存（大文件，可重跑 build_kg.py 重建）
+kg_graph.pkl
+kg_symptom_index.pkl
+
+# 日志与运行时输出
+output/
+*.log
+graph.png
+
+# 评估报告
+eval_reports/
+
+# IDE
+.idea/
+.ipynb_checkpoints/
+.vscode/
+
+# 数据集（input/ 下大数据，本地下载，不入库）
+input/
