@@ -5,7 +5,7 @@ drug_taboo 工具 + generate_drug 节点 + route_after_tools 路由 + agent 工�
 与 e2e_regression.py 的「完整图流」不同，本脚本照搬 verify_kg_integration.py 的
 「分项 mock」模式，逐项验证四个环节，不真正读写 PG，也不走完整 create_graph。
 
-用法（xiangmu-2 环境，需先有 drug_contraindications.json）：
+用法（需先有 drug_contraindications.json）：
     python verify_drug_taboo.py
 """
 import os

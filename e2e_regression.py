@@ -5,7 +5,7 @@
 真实 PostgresSaver（checkpoint）+ PostgresStore（记忆）+ ChromaDB 四工具，
 验证 agent→call_tools→(consult→summarize / generate_kg / generate_qa / generate_drug) 四条链路。
 
-用法（需 langgraph_postgres 容器已起，xiangmu-2 环境）：
+用法（需 langgraph_postgres 容器已起）：
     python e2e_regression.py
 """
 import os

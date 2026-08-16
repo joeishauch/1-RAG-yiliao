@@ -3,7 +3,7 @@
 jsonl2chroma.py
 功能：把医疗问答 JSON / JSONL 数据导入 ChromaDB，绕过 PDF 解析流程。
 
-背景：课程自带的 vectorSave.py 只吃 PDF，而开源的医疗问答数据集
+背景：早期基于 PDF 的导入脚本只吃 PDF，而开源的医疗问答数据集
 （Huatuo-26M-Lite、huatuo_encyclopedia_qa 等）都是 JSON 格式。
 本脚本把这些问答对组织成「可检索文本 + 结构化 metadata」灌入 ChromaDB，
 复用 utils.llms 里同一套 embedding（通义 text-embedding-v1），
@@ -35,10 +35,10 @@ logger = logging.getLogger(__name__)
 # LLM 类型：与 utils/config.py 保持一致；deepseek / qwen 的 embedding 都是通义 text-embedding-v1
 LLM_TYPE = "deepseek"
 
-# ChromaDB 持久化路径：与 vectorSave.py / Config.CHROMADB_DIRECTORY 保持一致
+# ChromaDB 持久化路径：与 Config.CHROMADB_DIRECTORY 保持一致
 CHROMADB_DIRECTORY = "chromaDB"
 
-# 单批 embedding 条数（与 vectorSave.py 保持一致，控制请求频率）
+# 单批 embedding 条数（控制请求频率）
 BATCH_SIZE = 25
 
 # 正文最大长度（字符）：通义 text-embedding-v1 输入上限为 2048 token，中文约 1 字 ≈ 1 token，
