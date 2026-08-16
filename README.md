@@ -77,7 +77,7 @@ agent（ReAct，选择工具）──► call_tools（ParallelToolNode 并行执
 ## 📁 目录结构
 
 ```
-L1-Project-2/
+.
 ├── main.py                  # FastAPI 服务 + HITL review 端点
 ├── ragAgent.py              # LangGraph 状态图（节点/路由/编译）
 ├── cli.py                   # 统一 CLI 入口（chat / serve / ui / eval）
