@@ -86,6 +86,8 @@ class MessagesState(TypedDict):
     review_status: Optional[str]
     # 给患者的精简版分诊结论（summarize 写入，review 通过后作为最终回答；不含分诊依据）
     patient_summary: Optional[str]
+    # 推荐科室列表（summarize 写入，review/科室流转据此定首选科室与备选科室）
+    recommend_departments: Optional[list[str]]
 
 
 # 分诊结论结构化输出模型（JSON Schema 约束，避免依赖文本标记裁剪）
@@ -538,6 +540,7 @@ def summarize(state: MessagesState, llm_chat) -> dict:
             "messages": [AIMessage(content=draft_text)],
             "risk_level": "high",
             "patient_summary": patient_text,
+            "recommend_departments": deps,
         }
     except Exception as e:
         # structured_output 失败（模型/网络/校验异常）时兜底，避免节点崩溃
@@ -546,6 +549,7 @@ def summarize(state: MessagesState, llm_chat) -> dict:
             "messages": [AIMessage(content="无法生成会诊结论，请稍后重试。")],
             "risk_level": "high",
             "patient_summary": "无法生成会诊结论，请稍后重试。",
+            "recommend_departments": [],
         }
 
 
@@ -667,17 +671,31 @@ def review(state: MessagesState, config: RunnableConfig) -> dict:
         "draft": draft,
         "risk_level": risk_level,
         "safety_hits": safety_flags(draft),
+        # 推荐科室列表（科室流转据此确定首选/备选科室）
+        "departments": state.get("recommend_departments") or [],
     })
 
     action = (decision or {}).get("action", "reject")
     revised = (decision or {}).get("revised_answer") or ""
+    # 审核医生署名（decision 由医生端传入）：姓名脱敏为「姓+医生」，科室/职称可选
+    reviewer_name = (decision or {}).get("reviewer_name") or ""
+    reviewer_dept = (decision or {}).get("reviewer_department") or ""
+    reviewer_title = (decision or {}).get("reviewer_title") or ""
+    sign_off = ""
+    if reviewer_name:
+        masked = f"{reviewer_name[0]}医生"  # 姓名脱敏：只留姓氏
+        core = f"{reviewer_dept}·{masked}" if reviewer_dept else masked
+        if reviewer_title:
+            core = f"{core}（{reviewer_title}）"
+        sign_off = f"\n\n（本建议已由 {core} 审核）"
+
     if action == "approve":
         # 通过：给患者返回精简版（推荐科室 + 就医建议，不含分诊依据）；无精简版则回退完整草稿
         patient_text = state.get("patient_summary") or draft
-        return {"review_status": "approved", "messages": [AIMessage(content=patient_text)]}
+        return {"review_status": "approved", "messages": [AIMessage(content=patient_text + sign_off)]}
     if action == "revise":
         # 改写：追加新 AIMessage（边界按最后一条 AI 取内容时以改写版为准）
-        return {"review_status": "revised", "messages": [AIMessage(content=revised)]}
+        return {"review_status": "revised", "messages": [AIMessage(content=revised + sign_off)]}
     # reject：拦截，返回拒答兜底文案（有改写文本则用改写文本，否则用配置兜底）
     return {
         "review_status": "rejected",

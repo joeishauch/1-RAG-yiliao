@@ -4,6 +4,8 @@ import gradio as gr
 import requests
 # 导入 json 库，用于处理 JSON 数据
 import json
+# 导入 os 库，用于账号持久化文件读写
+import os
 # 导入 logging 库，用于记录日志
 import logging
 # 导入 re 库，用于正则表达式操作
@@ -34,6 +36,32 @@ stream_flag = False # False
 users_db = {}
 # 初始化一个空字典，用于存储用户名与用户 ID 的映射
 user_id_map = {}
+# 患者账号持久化文件 + 手机号正则（账号统一为 11 位手机号，1 开头）
+USERS_FILE = "output/users.json"
+PHONE_RE = re.compile(r"^1[3-9]\d{9}$")
+
+
+def _load_users_db():
+    """启动时从 users.json 加载已注册账号（含 user_id 与会话历史）。"""
+    global users_db
+    if os.path.exists(USERS_FILE):
+        try:
+            with open(USERS_FILE, "r", encoding="utf-8") as f:
+                users_db = json.load(f)
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error(f"读取患者账号文件失败，回退空库：{e}")
+            users_db = {}
+
+
+def _save_users_db():
+    """注册 / 登录后写回 users.json，保证重启后账号不丢失。"""
+    os.makedirs(os.path.dirname(USERS_FILE), exist_ok=True)
+    with open(USERS_FILE, "w", encoding="utf-8") as f:
+        json.dump(users_db, f, ensure_ascii=False, indent=2)
+
+
+# 启动加载持久化账号
+_load_users_db()
 # 轮询退避状态：等待审核的会话集合 + 各会话开始等待/上次真实请求时间戳
 awaiting_conversations = set()
 awaiting_start = {}
@@ -145,7 +173,11 @@ def send_message(user_message, history, user_id, conversation_id, username):
                 # 标记该会话进入等待审核，供轮询函数检测结果
                 awaiting_conversations.add(conversation_id)
                 awaiting_start[conversation_id] = time.time()
-                review_msg = "⏳ 已提交医生审核，请稍候…（结果会自动刷新）"
+                # 审核中状态带首选科室（后端返回推荐科室列表，首选为 [0]）
+                departments = response_json.get("departments") or []
+                dept = departments[0] if departments else None
+                review_msg = f"⏳ 已提交 {dept} 医生审核，请稍候…（结果会自动刷新）" if dept \
+                    else "⏳ 已提交医生审核，请稍候…（结果会自动刷新）"
                 updated_history = history[:-1] + [{"role": "assistant", "content": review_msg}]
                 yield updated_history, updated_history, None, ""
                 return
@@ -165,19 +197,24 @@ def send_message(user_message, history, user_id, conversation_id, username):
 
 # 定义注册用户的函数
 def register(username, password):
-    # 如果用户名已存在，返回错误提示
+    # 账号须为 11 位手机号（1 开头）
+    if not PHONE_RE.match(username or ""):
+        return "手机号格式不正确（须 11 位，1 开头）！"
+    # 如果手机号已存在，返回错误提示
     if username in users_db:
-        return "用户名已存在！"
+        return "该手机号已注册！"
     # 生成唯一用户 ID
     user_id = generate_unique_user_id(username)
     # 在用户数据库中添加新用户信息
     users_db[username] = {"password": password, "user_id": user_id, "conversations": {}}
+    # 账号持久化写回
+    _save_users_db()
     # 返回注册成功的提示
     return "注册成功！请关闭弹窗并登录。"
 
 # 定义用户登录的函数
 def login(username, password):
-    # 检查用户名是否存在且密码匹配
+    # 检查手机号是否存在且密码匹配
     if username in users_db and users_db[username]["password"] == password:
         # 获取用户 ID
         user_id = users_db[username]["user_id"]
@@ -192,10 +229,12 @@ def login(username, password):
             "create_time": create_time,
             "title_set": False
         }
+        # 账号持久化写回
+        _save_users_db()
         # 返回登录成功的结果及相关信息
         return True, username, user_id, conversation_id, "登录成功！"
     # 如果登录失败，返回错误提示
-    return False, None, None, None, "用户名或密码错误！"
+    return False, None, None, None, "手机号或密码错误！"
 
 # 定义创建新会话的函数
 def new_conversation(username):
@@ -213,6 +252,8 @@ def new_conversation(username):
         "create_time": create_time,
         "title_set": False
     }
+    # 账号持久化写回
+    _save_users_db()
     # 返回成功提示和新会话 ID
     return "新会话创建成功！", conversation_id
 
@@ -288,6 +329,7 @@ def poll_review_result(user_id, conversation_id, chatbot_history, username):
             # 同步写回用户数据库
             if username and conversation_id and username in users_db and conversation_id in users_db[username]["conversations"]:
                 users_db[username]["conversations"][conversation_id]["history"] = updated_history
+                _save_users_db()
             # 清理等待状态
             awaiting_conversations.discard(conversation_id)
             awaiting_start.pop(conversation_id, None)
@@ -326,7 +368,7 @@ with gr.Blocks(title="聊天助手", css="""
         # 显示标题
         gr.Markdown("## 聊天助手")
         # 定义用户名输入框
-        login_username = gr.Textbox(label="用户名", placeholder="请输入用户名")
+        login_username = gr.Textbox(label="手机号", placeholder="请输入手机号")
         # 定义密码输入框，隐藏输入内容
         login_password = gr.Textbox(label="密码", placeholder="请输入密码", type="password")
         # 创建一行布局放置登录和注册按钮
@@ -369,7 +411,7 @@ with gr.Blocks(title="聊天助手", css="""
     # 定义注册弹窗布局，初始不可见
     with gr.Column(visible=False, elem_classes="modal") as register_modal:
         # 定义注册用户名输入框
-        reg_username = gr.Textbox(label="用户名", placeholder="请输入用户名")
+        reg_username = gr.Textbox(label="手机号", placeholder="请输入手机号")
         # 定义注册密码输入框，隐藏输入内容
         reg_password = gr.Textbox(label="密码", placeholder="请输入密码", type="password")
         # 创建一行布局放置提交和关闭按钮
@@ -492,7 +534,9 @@ with gr.Blocks(title="聊天助手", css="""
     # 定义更新聊天历史的函数
     def update_history(chatbot_output, history, user, conv_id):
         # 如果用户和会话 ID 存在，更新数据库中的聊天历史
-        if user and conv_id: users_db[user]["conversations"][conv_id]["history"] = chatbot_output
+        if user and conv_id:
+            users_db[user]["conversations"][conv_id]["history"] = chatbot_output
+            _save_users_db()
         return chatbot_output
 
     # 绑定发送按钮点击事件，发送消息并更新界面

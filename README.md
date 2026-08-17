@@ -21,7 +21,9 @@
 - **拒答免责**：规则引擎（无 LLM）拦截危险输入（自杀 / 自残 / 伤人），出口检测肯定式诊断表述并追加免责提示。
 - **风险分级**：高风险（分诊 / 用药）→ 阻断式强制医生审核；中低风险直出。
 - **医生审核三态**：`approve`（通过）/ `revise`（改写）/ `reject`（驳回），基于 LangGraph `interrupt()` + `Command(resume=...)` 实现。
-- **患者 / 医生职责分离**：高风险时患者端只显示「已提交医生审核」，看不到草稿；独立医生审核端（`doctor_ui.py`，端口 7861）拉取待审队列并审核。患者端只看「推荐科室 + 就医建议」，**分诊依据仅医生可见**（信息隔离）。
+- **科室流转（转诊式审核）**：高风险问题先推给相关性最高的首选科室，该科不认可可 `transfer` 移交目标 / 备选科室，上限 2 次防踢皮球；每次移交落 `output/triage_feedback.jsonl` 纠错数据，反哺分诊库（数据飞轮）。
+- **患者 / 医生职责分离**：高风险时患者端只显示「已提交 XX 科医生审核」，看不到草稿；独立医生审核端（`doctor_ui.py`，端口 7861）拉取待审队列并审核。患者端只看「推荐科室 + 就医建议」，**分诊依据仅医生可见**（信息隔离）；审核通过后答案底部显示「本建议已由 内科·王医生 审核」脱敏署名。
+- **医生账号体系**：医生不能自助注册，管理员建号（`admin/admin123`）——账号为手机号、绑定姓名（追责）+ 科室（权限）、密码 sha256+盐哈希持久化；医生登录后只看自己科室队列。患者端账号统一手机号并持久化 `output/users.json`。
 - **全程审计**：`output/audit.jsonl` 记录 `block` / `draft` / `review_decision` / `final` 事件，AI 输出与人工修改均可追溯。
 
 ---
@@ -136,7 +138,7 @@ python cli.py chat                    # 交互式问答（高风险场景触发�
 python cli.py chat -v                 # 打印节点流转 + 工具调用
 python cli.py serve                   # 启动 API（http://127.0.0.1:8012/docs）
 python cli.py ui                      # 启动患者端（http://127.0.0.1:7860）
-python doctor_ui.py                   # 启动医生审核端（http://127.0.0.1:7861，密码 admin）
+python doctor_ui.py                   # 启动医生审核端（http://127.0.0.1:7861，管理员 admin/admin123）
 python cli.py eval retrieval          # 检索质量评估
 python cli.py eval judge --limit 20   # LLM-as-judge 分诊质量评估
 python cli.py eval e2e                # 端到端四链路回归

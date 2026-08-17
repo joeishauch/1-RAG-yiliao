@@ -22,6 +22,9 @@ import sys
 import time
 # 导入UUID模块，用于生成唯一标识符
 import uuid
+# 用于密码哈希（sha256）与随机盐生成（医生/患者账号持久化）
+import hashlib
+import secrets
 # 从typing模块导入类型提示工具
 from typing import Optional
 # 导入Pydantic的基类和字段定义工具
@@ -89,10 +92,14 @@ class ChatCompletionRequest(BaseModel):
 class ReviewRequest(BaseModel):
     userId: str
     conversationId: str
-    action: str                       # approve / revise / reject
+    action: str                       # approve / revise / reject / transfer
     revised_answer: Optional[str] = None
     comment: Optional[str] = None
-    reviewer: Optional[str] = "human"
+    reviewer: Optional[str] = "human"  # 审核人账号（医生手机号）
+    target_department: Optional[str] = None  # transfer 目标科室
+    reviewer_name: Optional[str] = None      # 审核医生姓名（追责 + 患者端脱敏展示）
+    reviewer_department: Optional[str] = None  # 审核医生所属科室
+    reviewer_title: Optional[str] = None      # 审核医生职称（可选）
 
 # 定义待审核响应类（interrupt 命中时返回）
 class ReviewPendingResponse(BaseModel):
@@ -102,6 +109,22 @@ class ReviewPendingResponse(BaseModel):
     risk_level: Optional[str] = None
     draft: str
     safety_hits: List[str] = Field(default_factory=list)
+    departments: List[str] = Field(default_factory=list)  # 推荐科室列表（首选为 [0]，供患者端展示审核科室）
+
+# 医生登录请求（管理员填 admin，医生填手机号）
+class DoctorLoginRequest(BaseModel):
+    account: str
+    password: str
+
+# 管理员建号请求（医生不能自助注册）
+class DoctorRegisterRequest(BaseModel):
+    admin_account: str = "admin"     # 管理员账号（校验建号权限）
+    admin_password: str              # 管理员密码
+    phone: str                       # 新医生手机号
+    password: str                    # 新医生密码
+    name: str                        # 医生姓名（追责到人）
+    title: Optional[str] = None      # 职称（可选）
+    department: str                  # 绑定科室（权限）
 
 # 定义ChatCompletionResponseChoice类
 class ChatCompletionResponseChoice(BaseModel):
@@ -154,9 +177,75 @@ def format_response(response):
     return '\n\n'.join(formatted_paragraphs)
 
 
-# 待人工审核队列：thread_id -> {thread_id, userId, conversationId, risk_level, draft, safety_hits}
+# 分诊系统 16 个科室（与分诊库 label 完全对齐，含「其他」兜底标签）
+DEPARTMENTS = [
+    "妇产科", "内科", "皮肤性病科", "儿科", "眼耳鼻喉科", "肿瘤科", "神经科学", "外科",
+    "男性健康科", "感染与免疫科", "口腔科", "心理科学", "中医科", "生殖健康科", "急诊科", "其他",
+]
+
+# 科室流转：最多移交次数（防踢皮球，达到上限后医生必须 approve/reject）
+TRANSFER_MAX = 2
+
+# 医生账号持久化文件（管理员 + 各科室医生，密码 sha256+盐哈希）
+DOCTOR_ACCOUNTS_FILE = "output/doctor_accounts.json"
+# 科室纠错数据文件（transfer 落盘，攒批重灌分诊库 → 数据飞轮）
+TRIAGE_FEEDBACK_FILE = "output/triage_feedback.jsonl"
+# 手机号正则（医生/患者账号统一：1 开头，第二位 3-9）
+PHONE_RE = re.compile(r"^1[3-9]\d{9}$")
+
+# 医生账号内存缓存：account -> {salt, password_hash, name, title, department, is_admin}
+# 启动时从 doctor_accounts.json 加载；管理员建号后写回文件
+doctor_accounts = {}
+
+
+def _hash_password(password: str, salt: str) -> str:
+    """密码哈希：sha256(salt + password)，盐为随机 hex。"""
+    return hashlib.sha256(f"{salt}{password}".encode("utf-8")).hexdigest()
+
+
+def _load_doctor_accounts() -> None:
+    """启动时加载医生账号；不存在则初始化管理员 admin/admin123。"""
+    global doctor_accounts
+    if os.path.exists(DOCTOR_ACCOUNTS_FILE):
+        try:
+            with open(DOCTOR_ACCOUNTS_FILE, "r", encoding="utf-8") as f:
+                doctor_accounts = json.load(f)
+            return
+        except (json.JSONDecodeError, OSError) as e:
+            logger.error(f"读取医生账号文件失败，回退初始化：{e}")
+    # 首启：初始化管理员 admin / admin123
+    salt = secrets.token_hex(16)
+    doctor_accounts = {
+        "admin": {
+            "salt": salt,
+            "password_hash": _hash_password("admin123", salt),
+            "name": "管理员",
+            "title": "",
+            "department": None,
+            "is_admin": True,
+        }
+    }
+    _save_doctor_accounts()
+
+
+def _save_doctor_accounts() -> None:
+    """医生账号写回磁盘（建号 / 改密后调用）。"""
+    os.makedirs(os.path.dirname(DOCTOR_ACCOUNTS_FILE), exist_ok=True)
+    with open(DOCTOR_ACCOUNTS_FILE, "w", encoding="utf-8") as f:
+        json.dump(doctor_accounts, f, ensure_ascii=False, indent=2)
+
+
+# 待人工审核队列：thread_id -> {thread_id, userId, conversationId, risk_level, draft, safety_hits,
+#                               current_department, candidate_departments, transfer_count}
 # 由 handle_non_stream_response 入队、review_resume 出队、GET /v1/review/pending 读取
 pending_queue = {}
+
+
+def _append_feedback(record: dict) -> None:
+    """科室纠错数据追加到 triage_feedback.jsonl（数据飞轮，攒批重灌分诊库）。"""
+    os.makedirs(os.path.dirname(TRIAGE_FEEDBACK_FILE), exist_ok=True)
+    with open(TRIAGE_FEEDBACK_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def _extract_last_ai_content(state: dict) -> Optional[str]:
@@ -188,6 +277,8 @@ async def lifespan(app: FastAPI):
     """
     # 声明全局变量 graph 和 tool_config
     global graph, tool_config
+    # 加载医生账号（首启初始化 admin/admin123）
+    _load_doctor_accounts()
     # 初始化数据库连接池为 None
     db_connection_pool = None
     try:
@@ -300,6 +391,8 @@ async def handle_non_stream_response(user_input, graph, tool_config, config, red
                     risk_level=payload.get("risk_level"), draft=payload.get("draft"),
                     redacted=redaction_count > 0, redaction_count=redaction_count,
                 ))
+                # 推荐科室列表（review 节点 interrupt payload 传入，首选为 [0]）
+                departments = payload.get("departments", []) or []
                 # 入待审队列（供医生端 GET /v1/review/pending 拉取）
                 pending_queue[thread_id] = {
                     "thread_id": thread_id,
@@ -308,6 +401,11 @@ async def handle_non_stream_response(user_input, graph, tool_config, config, red
                     "risk_level": payload.get("risk_level"),
                     "draft": payload.get("draft", ""),
                     "safety_hits": payload.get("safety_hits", []),
+                    "question": user_input,  # 脱敏后的用户主诉（transfer 纠错数据用）
+                    # 科室流转维度：首选科室 + 备选科室 + 移交计数
+                    "current_department": departments[0] if departments else None,
+                    "candidate_departments": departments[1:],
+                    "transfer_count": 0,
                 }
                 return JSONResponse(content=ReviewPendingResponse(
                     thread_id=thread_id,
@@ -315,6 +413,7 @@ async def handle_non_stream_response(user_input, graph, tool_config, config, red
                     risk_level=payload.get("risk_level"),
                     draft=payload.get("draft", ""),
                     safety_hits=payload.get("safety_hits", []),
+                    departments=departments,
                 ).model_dump())
             # 遍历事件中的所有值
             for value in event.values():
@@ -570,11 +669,45 @@ async def review_resume(request: ReviewRequest, dependencies: Tuple[any, any] = 
         graph, tool_config = dependencies
         thread_id = f"{request.userId}@@{request.conversationId}"
         config = {"configurable": {"thread_id": thread_id, "user_id": request.userId}}
+
+        # 科室移交（transfer）：不 resume 图，只改队列当前科室 + 落纠错数据，等目标科室再审
+        if request.action == "transfer":
+            item = pending_queue.get(thread_id)
+            if not item:
+                raise HTTPException(status_code=404, detail="待审项不存在或已处理")
+            if item.get("transfer_count", 0) >= TRANSFER_MAX:
+                raise HTTPException(status_code=400, detail=f"已达最大移交次数（{TRANSFER_MAX}），请直接通过或驳回")
+            target = request.target_department
+            if not target:
+                raise HTTPException(status_code=400, detail="移交需指定 target_department")
+            from_dept = item.get("current_department")
+            item["transfer_count"] = item.get("transfer_count", 0) + 1
+            item["current_department"] = target
+            # 落科室纠错数据（数据飞轮）
+            _append_feedback({
+                "question": item.get("question", ""),
+                "from_dept": from_dept,
+                "to_dept": target,
+                "doctor_phone": request.reviewer,
+                "doctor_name": request.reviewer_name or "",
+                "thread_id": thread_id,
+                "ts": int(time.time()),
+            })
+            write_audit(build_record(
+                event="transfer", thread_id=thread_id, user_id=request.userId,
+                action="transfer", from_department=from_dept, to_department=target,
+                reviewer=request.reviewer, comment=request.comment,
+            ))
+            return JSONResponse(content={"status": "transferred", "to_department": target})
+
         decision = {
             "action": request.action,
             "revised_answer": request.revised_answer,
             "comment": request.comment,
             "reviewer": request.reviewer,
+            "reviewer_name": request.reviewer_name,
+            "reviewer_department": request.reviewer_department,
+            "reviewer_title": request.reviewer_title,
         }
 
         # 续跑：无需重传 input，checkpoint 已存 state；返回最终 state
@@ -614,9 +747,57 @@ async def review_resume(request: ReviewRequest, dependencies: Tuple[any, any] = 
 
 
 @app.get("/v1/review/pending")
-async def review_pending(dependencies: Tuple[any, any] = Depends(get_dependencies)):
-    """返回待人工审核队列（医生端拉取）。"""
-    return JSONResponse(content={"items": list(pending_queue.values())})
+async def review_pending(department: Optional[str] = None, dependencies: Tuple[any, any] = Depends(get_dependencies)):
+    """返回待人工审核队列（医生端拉取）；department 非空时仅返回该科室待审项。"""
+    items = list(pending_queue.values())
+    if department:
+        items = [it for it in items if it.get("current_department") == department]
+    return JSONResponse(content={"items": items})
+
+
+@app.post("/v1/doctor/login")
+async def doctor_login(request: DoctorLoginRequest):
+    """医生/管理员登录：校验密码，返回身份信息（is_admin/department/name/title）。"""
+    acct = doctor_accounts.get(request.account)
+    if not acct or _hash_password(request.password, acct["salt"]) != acct["password_hash"]:
+        return JSONResponse(content={"ok": False, "detail": "账号或密码错误"})
+    return JSONResponse(content={
+        "ok": True,
+        "account": request.account,
+        "is_admin": acct.get("is_admin", False),
+        "department": acct.get("department"),
+        "name": acct.get("name"),
+        "title": acct.get("title"),
+    })
+
+
+@app.post("/v1/doctor/register")
+async def doctor_register(request: DoctorRegisterRequest):
+    """管理员建号（医生不能自助注册）；账号为手机号，绑定科室 + 姓名（追责）。"""
+    admin = doctor_accounts.get(request.admin_account)
+    if not admin or not admin.get("is_admin"):
+        return JSONResponse(content={"ok": False, "detail": "无建号权限"}, status_code=403)
+    if _hash_password(request.admin_password, admin["salt"]) != admin["password_hash"]:
+        return JSONResponse(content={"ok": False, "detail": "管理员密码错误"}, status_code=403)
+    if not PHONE_RE.match(request.phone):
+        return JSONResponse(content={"ok": False, "detail": "账号须为 11 位手机号（1 开头）"}, status_code=400)
+    if not request.name.strip():
+        return JSONResponse(content={"ok": False, "detail": "姓名必填"}, status_code=400)
+    if request.department not in DEPARTMENTS:
+        return JSONResponse(content={"ok": False, "detail": f"科室须为 {DEPARTMENTS} 之一"}, status_code=400)
+    if request.phone in doctor_accounts:
+        return JSONResponse(content={"ok": False, "detail": "该手机号已存在"}, status_code=400)
+    salt = secrets.token_hex(16)
+    doctor_accounts[request.phone] = {
+        "salt": salt,
+        "password_hash": _hash_password(request.password, salt),
+        "name": request.name.strip(),
+        "title": request.title or "",
+        "department": request.department,
+        "is_admin": False,
+    }
+    _save_doctor_accounts()
+    return JSONResponse(content={"ok": True, "phone": request.phone})
 
 
 @app.get("/v1/chat/state")
