@@ -10,6 +10,8 @@ import logging
 import re
 # 导入 uuid 库，用于生成唯一标识符
 import uuid
+# 导入 time 库，用于轮询退避计时
+import time
 # 导入 datetime 库，用于处理日期和时间
 from datetime import datetime
 
@@ -20,6 +22,8 @@ logger = logging.getLogger(__name__)
 
 # 定义后端服务接口的 URL 地址
 url = "http://localhost:8012/v1/chat/completions"
+# 定义会话状态查询端点 URL（轮询拿审核结果）
+state_url = "http://localhost:8012/v1/chat/state"
 # 定义 HTTP 请求头，指定内容类型为 JSON
 headers = {"Content-Type": "application/json"}
 
@@ -30,6 +34,14 @@ stream_flag = False # False
 users_db = {}
 # 初始化一个空字典，用于存储用户名与用户 ID 的映射
 user_id_map = {}
+# 轮询退避状态：等待审核的会话集合 + 各会话开始等待/上次真实请求时间戳
+awaiting_conversations = set()
+awaiting_start = {}
+_last_poll = {}
+# 退避参数：前 3 分钟高频（3s），之后低频（20s，15~30s 取中）
+HIGH_FREQ_WINDOW = 180
+HIGH_INTERVAL = 3
+LOW_INTERVAL = 20
 
 # 定义生成唯一用户 ID 的函数
 def generate_unique_user_id(username):
@@ -49,6 +61,15 @@ def generate_unique_conversation_id(username):
     # 返回由用户名和 UUID 拼接而成的会话 ID
     return f"{username}_{uuid.uuid4()}"
 
+# 定义格式化回复内容的函数（模块级，供 send_message / poll_review_result 共用）
+def format_response(full_text):
+    # 将 <think> 标签替换为加粗的“思考过程”标题
+    formatted_text = re.sub(r'<think>', '**思考过程**：\n', full_text)
+    # 将 </think> 标签替换为加粗的“最终回复”标题
+    formatted_text = re.sub(r'</think>', '\n\n**最终回复**：\n', full_text)
+    # 返回去除前后空白的格式化文本
+    return formatted_text.strip()
+
 # 定义发送消息的函数，处理用户输入并获取后端回复
 def send_message(user_message, history, user_id, conversation_id, username):
     # 构造发送给后端的数据，包含用户消息、用户 ID 和会话 ID
@@ -62,7 +83,7 @@ def send_message(user_message, history, user_id, conversation_id, username):
     # 更新聊天历史，添加用户消息和临时占位回复
     history = history + [{"role": "user", "content": user_message}, {"role": "assistant", "content": "正在生成回复..."}]
     # 第一次 yield，返回当前的聊天历史和标题（标题暂不更新）
-    yield history, history, None
+    yield history, history, None, ""
 
     # 如果是首次消息，设置会话标题为用户消息的前 20 个字符或完整消息
     if username and conversation_id:
@@ -70,15 +91,6 @@ def send_message(user_message, history, user_id, conversation_id, username):
             new_title = user_message[:20] if len(user_message) > 20 else user_message
             users_db[username]["conversations"][conversation_id]["title"] = new_title
             users_db[username]["conversations"][conversation_id]["title_set"] = True
-
-    # 定义格式化回复内容的函数
-    def format_response(full_text):
-        # 将 <think> 标签替换为加粗的“思考过程”标题
-        formatted_text = re.sub(r'<think>', '**思考过程**：\n', full_text)
-        # 将 </think> 标签替换为加粗的“最终回复”标题
-        formatted_text = re.sub(r'</think>', '\n\n**最终回复**：\n', full_text)
-        # 返回去除前后空白的格式化文本
-        return formatted_text.strip()
 
     # 流式输出
     if stream_flag:
@@ -102,13 +114,13 @@ def send_message(user_message, history, user_id, conversation_id, username):
                                     logger.info(f"接收数据:{formatted_content}")
                                     assistant_response += formatted_content
                                     updated_history = history[:-1] + [{"role": "assistant", "content": assistant_response}]
-                                    yield updated_history, updated_history, None
+                                    yield updated_history, updated_history, None, ""
                                 if response_data.get('choices', [{}])[0].get('finish_reason') == "stop":
                                     logger.info(f"接收JSON数据结束")
                                     break
                             except json.JSONDecodeError as e:
                                 logger.error(f"JSON解析错误: {e}")
-                                yield history[:-1] + [{"role": "assistant", "content": "解析响应时出错，请稍后再试。"}]
+                                yield history[:-1] + [{"role": "assistant", "content": "解析响应时出错，请稍后再试。"}], history[:-1] + [{"role": "assistant", "content": "解析响应时出错，请稍后再试。"}], None, ""
                                 break
                         else:
                             logger.info(f"无效JSON格式: {json_str}")
@@ -116,25 +128,40 @@ def send_message(user_message, history, user_id, conversation_id, username):
                         logger.info(f"收到空行")
                 else:
                     logger.info("流式响应结束但未明确结束")
-                    yield history[:-1] + [{"role": "assistant", "content": "未收到完整响应。"}]
+                    yield history[:-1] + [{"role": "assistant", "content": "未收到完整响应。"}], history[:-1] + [{"role": "assistant", "content": "未收到完整响应。"}], None, ""
         except requests.RequestException as e:
             logger.error(f"请求失败: {e}")
-            yield history[:-1] + [{"role": "assistant", "content": "请求失败，请稍后再试。"}]
+            yield history[:-1] + [{"role": "assistant", "content": "请求失败，请稍后再试。"}], history[:-1] + [{"role": "assistant", "content": "请求失败，请稍后再试。"}], None, ""
 
     # 非流式输出
     else:
-        # 向后端发送 POST 请求并获取响应
-        response = requests.post(url, headers=headers, data=json.dumps(data))
-        # 将响应解析为 JSON 格式
-        response_json = response.json()
-        # 提取助手的回复内容
-        assistant_content = response_json['choices'][0]['message']['content']
-        # 对助手回复进行格式化
-        formatted_content = format_response(assistant_content)
-        # 更新聊天历史，替换临时占位回复为格式化后的内容
-        updated_history = history[:-1] + [{"role": "assistant", "content": formatted_content}]
-        # 第二次 yield，返回更新后的聊天历史和标题（标题仍不更新）
-        yield updated_history, updated_history, None
+        try:
+            # 向后端发送 POST 请求并获取响应
+            response = requests.post(url, headers=headers, data=json.dumps(data))
+            # 将响应解析为 JSON 格式
+            response_json = response.json()
+            # 高风险人工审核中断：后端返回 pending_review（无 choices 字段）
+            if response_json.get("status") == "pending_review":
+                # 标记该会话进入等待审核，供轮询函数检测结果
+                awaiting_conversations.add(conversation_id)
+                awaiting_start[conversation_id] = time.time()
+                review_msg = "⏳ 已提交医生审核，请稍候…（结果会自动刷新）"
+                updated_history = history[:-1] + [{"role": "assistant", "content": review_msg}]
+                yield updated_history, updated_history, None, ""
+                return
+            # 提取助手的回复内容
+            assistant_content = response_json['choices'][0]['message']['content']
+            # 对助手回复进行格式化
+            formatted_content = format_response(assistant_content)
+            # 更新聊天历史，替换临时占位回复为格式化后的内容
+            updated_history = history[:-1] + [{"role": "assistant", "content": formatted_content}]
+            # 第二次 yield，返回更新后的聊天历史和标题（标题仍不更新）
+            yield updated_history, updated_history, None, ""
+        except Exception as e:
+            # 兜底：异常时也 yield 错误提示，保证 .then 链跑完（输入框能被清空）
+            logger.error(f"非流式请求处理异常: {e}")
+            updated_history = history[:-1] + [{"role": "assistant", "content": f"请求处理异常：{e}"}]
+            yield updated_history, updated_history, None, ""
 
 # 定义注册用户的函数
 def register(username, password):
@@ -236,6 +263,41 @@ def load_conversation(username, selected_option):
     # 否则返回空历史
     return []
 
+# 定义轮询函数：检测等待审核的会话是否已完成，完成则更新聊天（智能退避）
+def poll_review_result(user_id, conversation_id, chatbot_history, username):
+    """每 3s 被 Timer 触发一次；退避决定是否真实请求后端。
+
+    关键：本函数输出指向不可见的 gr.State（poll_result_state），而不是直接写 chatbot。
+    这样 Timer 每次 tick 都不会触碰 chatbot 的可见 DOM，彻底消除界面闪烁；
+    只有当审核完成、返回新历史时才触发 State 的 change，再由 change 回调更新 chatbot。
+    """
+    if conversation_id not in awaiting_conversations:
+        return gr.skip()
+    now = time.time()
+    started = awaiting_start.get(conversation_id, now)
+    interval = HIGH_INTERVAL if (now - started) < HIGH_FREQ_WINDOW else LOW_INTERVAL
+    if now - _last_poll.get(conversation_id, 0) < interval:
+        return gr.skip()  # 空转：不请求，也不写 State，避免任何 UI 抖动
+    _last_poll[conversation_id] = now
+    try:
+        resp = requests.get(state_url, params={"userId": user_id, "conversationId": conversation_id}, timeout=10)
+        resp_json = resp.json()
+        if resp_json.get("status") == "done":
+            content = format_response(resp_json.get("content", ""))
+            updated_history = chatbot_history[:-1] + [{"role": "assistant", "content": content}]
+            # 同步写回用户数据库
+            if username and conversation_id and username in users_db and conversation_id in users_db[username]["conversations"]:
+                users_db[username]["conversations"][conversation_id]["history"] = updated_history
+            # 清理等待状态
+            awaiting_conversations.discard(conversation_id)
+            awaiting_start.pop(conversation_id, None)
+            _last_poll.pop(conversation_id, None)
+            # 写 poll_result_state，触发 change 回调去更新 chatbot
+            return updated_history
+    except Exception as e:
+        logger.error(f"轮询审核结果失败: {e}")
+    return gr.skip()
+
 # 使用 Gradio Blocks 创建前端界面
 with gr.Blocks(title="聊天助手", css="""
     .login-container { max-width: 400px; margin: 0 auto; padding-top: 100px; }
@@ -256,6 +318,8 @@ with gr.Blocks(title="聊天助手", css="""
     chatbot_history = gr.State([])
     # 定义状态变量，用于存储会话标题
     conversation_title = gr.State("创建新的聊天")
+    # 轮询结果中转 State：Timer 只写这个不可见 State，避免每次 tick 直接刷 chatbot 造成闪烁
+    poll_result_state = gr.State(None)
 
     # 定义登录页面布局，初始可见
     with gr.Column(visible=True, elem_classes="login-container") as login_page:
@@ -376,6 +440,19 @@ with gr.Blocks(title="聊天助手", css="""
         logout, None, [logged_in, current_user, current_user_id, login_page, chat_page, login_output, chatbot, current_conversation, chatbot_history, conversation_title]
     )
 
+    # 轮询绑定：每 3s 触发一次 poll_review_result，退避逻辑在函数内决定是否真实请求。
+    # 输出只写不可见的 poll_result_state，审核完成才经 change 回调刷新 chatbot，避免闪烁。
+    poll_timer = gr.Timer(3)
+    poll_timer.tick(
+        poll_review_result,
+        [current_user_id, current_conversation, chatbot_history, current_user],
+        [poll_result_state],
+    )
+    # 仅当审核完成、poll_result_state 真正变化时，才把最终回答写回 chatbot 显示
+    poll_result_state.change(
+        lambda hist: (hist, hist), [poll_result_state], [chatbot, chatbot_history]
+    )
+
     # 绑定历史会话按钮点击事件，显示历史弹窗
     history_button.click(show_history_modal, [current_user], [history_modal, conv_dropdown])
     # 绑定关闭历史弹窗按钮点击事件，隐藏历史弹窗
@@ -420,7 +497,7 @@ with gr.Blocks(title="聊天助手", css="""
 
     # 绑定发送按钮点击事件，发送消息并更新界面
     send.click(
-        send_message, [message, chatbot_history, current_user_id, current_conversation, current_user], [chatbot, chatbot_history, conversation_title]
+        send_message, [message, chatbot_history, current_user_id, current_conversation, current_user], [chatbot, chatbot_history, conversation_title, message]
     ).then(
         # 更新聊天历史
         update_history, [chatbot, chatbot_history, current_user, current_conversation], chatbot_history
@@ -431,13 +508,11 @@ with gr.Blocks(title="聊天助手", css="""
     ).then(
         # 更新标题显示
         update_title_display, [conversation_title], title_display
-    ).then(
-        # 清空消息输入框
-        lambda: "", None, message)
+    )
 
     # 绑定消息输入框的提交事件（Enter 键），发送消息并更新界面
     message.submit(
-        send_message, [message, chatbot_history, current_user_id, current_conversation, current_user], [chatbot, chatbot_history, conversation_title]
+        send_message, [message, chatbot_history, current_user_id, current_conversation, current_user], [chatbot, chatbot_history, conversation_title, message]
     ).then(
         # 更新聊天历史
         update_history, [chatbot, chatbot_history, current_user, current_conversation], chatbot_history
@@ -448,9 +523,7 @@ with gr.Blocks(title="聊天助手", css="""
     ).then(
         # 更新标题显示
         update_title_display, [conversation_title], title_display
-    ).then(
-        # 清空消息输入框
-        lambda: "", None, message)
+    )
 
 # 如果当前脚本作为主程序运行，则启动 Gradio 应用
 if __name__ == "__main__":

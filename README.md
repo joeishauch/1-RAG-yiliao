@@ -21,6 +21,7 @@
 - **拒答免责**：规则引擎（无 LLM）拦截危险输入（自杀 / 自残 / 伤人），出口检测肯定式诊断表述并追加免责提示。
 - **风险分级**：高风险（分诊 / 用药）→ 阻断式强制医生审核；中低风险直出。
 - **医生审核三态**：`approve`（通过）/ `revise`（改写）/ `reject`（驳回），基于 LangGraph `interrupt()` + `Command(resume=...)` 实现。
+- **患者 / 医生职责分离**：高风险时患者端只显示「已提交医生审核」，看不到草稿；独立医生审核端（`doctor_ui.py`，端口 7861）拉取待审队列并审核。患者端只看「推荐科室 + 就医建议」，**分诊依据仅医生可见**（信息隔离）。
 - **全程审计**：`output/audit.jsonl` 记录 `block` / `draft` / `review_decision` / `final` 事件，AI 输出与人工修改均可追溯。
 
 ---
@@ -67,7 +68,7 @@ agent（ReAct，选择工具）──► call_tools（ParallelToolNode 并行执
 | 检索 | ChromaDB 向量 + BM25 混合（jieba 分词）+ BGE-reranker 重排（RRF 融合） |
 | 知识图谱 | networkx 内存图，症状 → 疾病 → 治疗 / 药物 / 科室 多跳推理 |
 | 存储 | PostgreSQL（checkpoint + 长期记忆） |
-| 服务 | FastAPI（OpenAI 兼容接口，端口 8012）+ Gradio WebUI（端口 7860） |
+| 服务 | FastAPI（OpenAI 兼容接口，端口 8012）+ Gradio 患者端（7860）/ 医生审核端（7861） |
 | 配置 | pydantic-settings 集中管理（`.env`） |
 
 ---
@@ -79,7 +80,8 @@ agent（ReAct，选择工具）──► call_tools（ParallelToolNode 并行执
 ├── main.py                  # FastAPI 服务 + HITL review 端点
 ├── ragAgent.py              # LangGraph 状态图（节点/路由/编译）
 ├── cli.py                   # 统一 CLI 入口（chat / serve / ui / eval）
-├── webUI.py                 # Gradio 界面
+├── webUI.py                 # Gradio 患者端（7860）
+├── doctor_ui.py             # Gradio 医生审核端（7861）
 ├── app_launcher.py          # 一键启动器
 ├── utils/
 │   ├── config.py            # pydantic-settings 配置中心
@@ -133,7 +135,8 @@ docker-compose up -d
 python cli.py chat                    # 交互式问答（高风险场景触发终端人工审核）
 python cli.py chat -v                 # 打印节点流转 + 工具调用
 python cli.py serve                   # 启动 API（http://127.0.0.1:8012/docs）
-python cli.py ui                      # 启动 WebUI（http://127.0.0.1:7860）
+python cli.py ui                      # 启动患者端（http://127.0.0.1:7860）
+python doctor_ui.py                   # 启动医生审核端（http://127.0.0.1:7861，密码 admin）
 python cli.py eval retrieval          # 检索质量评估
 python cli.py eval judge --limit 20   # LLM-as-judge 分诊质量评估
 python cli.py eval e2e                # 端到端四链路回归
@@ -164,7 +167,7 @@ curl http://127.0.0.1:8012/v1/chat/review \
 
 ## 🧠 关键设计决策
 
-- **分诊会诊而非单次生成**：`retrieve → consult → summarize`，多科室视角并行出「可能性 + 依据」，再汇总成四段式结论（推荐科室 / 分诊依据 / 就医建议 / 免责声明）。
+- **分诊会诊而非单次生成**：`retrieve → consult → summarize`，多科室视角并行出「可能性 + 依据」，再汇总成分诊结论。输出用 **JSON Schema 结构化约束**（`recommend_departments` / `advice` / `basis`），患者端只看「推荐科室 + 就医建议」，`basis` 分诊依据仅医生可见。
 - **砍掉 grade + rewrite 闭环**：实测原始查询直接检索反而比改写后更准（神经科学 80% vs 改写后 50%），查询改写对分诊是负收益。
 - **置信度校准**：`score = cnt² / expected`（先验归一化，类似 TF-IDF），同时抑制大科基数优势与小样本 1 次命中噪声。
 - **风险分级而非一刀切**：高风险阻断式审核、中风险直出、低风险直出（二期预留快速确认 / 抽样审计 / 置信度路由）。

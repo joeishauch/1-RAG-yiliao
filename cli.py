@@ -7,7 +7,8 @@
 用法:
     python cli.py chat                 交互式问答（命令行）
     python cli.py serve                启动 FastAPI API 服务
-    python cli.py ui                   启动 Gradio Web 界面
+    python cli.py ui                   启动 Gradio Web 界面（用户端）
+    python doctor_ui.py                启动 Gradio Web 界面（医生端）
     python cli.py eval retrieval       检索质量评估（Hit@K/MRR）
     python cli.py eval judge            LLM-as-judge 分诊质量评估
     python cli.py eval e2e             端到端四链路回归

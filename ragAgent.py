@@ -84,6 +84,19 @@ class MessagesState(TypedDict):
     risk_level: Optional[str]
     # 审核状态（review 节点写入）：auto_approved / approved / revised / rejected
     review_status: Optional[str]
+    # 给患者的精简版分诊结论（summarize 写入，review 通过后作为最终回答；不含分诊依据）
+    patient_summary: Optional[str]
+
+
+# 分诊结论结构化输出模型（JSON Schema 约束，避免依赖文本标记裁剪）
+class TriageSummary(BaseModel):
+    """分诊结论三字段结构：患者看「推荐科室 + 就医建议」，医生看「分诊依据」。"""
+    # 推荐科室，按置信度从高到低排序；第一个为首选，其余为备选
+    recommend_departments: list[str] = Field(description="推荐科室，按置信度从高到低排序；第一个为首选科室，其余为备选科室")
+    # 就医建议（给患者的通俗表述）
+    advice: str = Field(description="就医建议：建议挂的科室、就诊注意事项、是否需转诊、紧急提醒")
+    # 分诊依据（仅医生端展示的专业分析）
+    basis: str = Field(description="分诊依据：综合第一层候选分布与各科室会诊意见的专业分析")
 
 # 定义工具配置管理类，用于管理工具列表与名称（路由由 route_after_tools 负责）
 class ToolConfig:
@@ -483,14 +496,9 @@ def consult(state: MessagesState, llm_chat, llm_embedding) -> dict:
 
 # 定义Node 会诊汇总函数
 def summarize(state: MessagesState, llm_chat) -> dict:
-    """汇总各科室会诊意见，生成最终分诊建议。
+    """汇总各科室会诊意见，用 JSON Schema 约束生成结构化分诊结论。
 
-    Args:
-        state: 当前对话状态。
-        llm_chat: Chat 模型。
-
-    Returns:
-        dict: 更新后的消息状态。
+    结构化结果拆两版：患者看「推荐科室排序 + 就医建议」，医生看完整草稿（含分诊依据）。
     """
     # 记录开始汇总会诊结果
     logger.info("Summarizing consultation results")
@@ -503,22 +511,42 @@ def summarize(state: MessagesState, llm_chat) -> dict:
         consultations = state.get("consultations", [])
         consultations_text = "\n\n".join(consultations) if consultations else "（无会诊意见）"
 
-        # 创建汇总处理链
-        summarize_chain = create_chain(llm_chat, Config.PROMPT_TEMPLATE_TXT_SUMMARIZE)
-        # 调用汇总链生成最终分诊建议
-        response = summarize_chain.invoke({
+        # 用 JSON Schema 强制结构化输出（TriageSummary），不依赖文本标记裁剪
+        summarize_chain = create_chain(llm_chat, Config.PROMPT_TEMPLATE_TXT_SUMMARIZE, structured_output=TriageSummary)
+        # 调用汇总链生成结构化分诊结论（result 为 TriageSummary 实例）
+        result = summarize_chain.invoke({
             "question": question,
             "first_pass": first_pass,
             "consultations": consultations_text,
         })
-        # 返回更新后的消息状态（分诊建议属高风险，需人工审核）
-        return {"messages": [response], "risk_level": "high"}
-    # 捕获索引或键错误
-    except (IndexError, KeyError) as e:
-        # 记录错误日志
-        logger.error(f"Message access error in summarize: {e}")
-        # 返回错误消息
-        return {"messages": [{"role": "system", "content": "无法生成会诊结论"}]}
+
+        # 组装患者版：推荐科室（首选 + 备选排序）+ 就医建议
+        deps = result.recommend_departments or []
+        if deps:
+            primary = deps[0]
+            backups = "、".join(deps[1:])
+            dept_text = f"推荐科室：首选【{primary}】" + (f"；备选：{backups}" if backups else "")
+        else:
+            dept_text = "推荐科室：（暂无法判断，请及时就医）"
+        patient_text = f"{dept_text}\n\n就医建议：{result.advice}"
+
+        # 组装医生版完整草稿：患者版 + 分诊依据
+        draft_text = f"{patient_text}\n\n【分诊依据】\n{result.basis}"
+
+        # messages 存完整草稿（review 节点据此审核 + safety_flags）；patient_summary 存精简版（通过后给患者）
+        return {
+            "messages": [AIMessage(content=draft_text)],
+            "risk_level": "high",
+            "patient_summary": patient_text,
+        }
+    except Exception as e:
+        # structured_output 失败（模型/网络/校验异常）时兜底，避免节点崩溃
+        logger.error(f"Summarize error: {e}")
+        return {
+            "messages": [AIMessage(content="无法生成会诊结论，请稍后重试。")],
+            "risk_level": "high",
+            "patient_summary": "无法生成会诊结论，请稍后重试。",
+        }
 
 
 def route_after_tools(state: MessagesState) -> str:
@@ -644,7 +672,9 @@ def review(state: MessagesState, config: RunnableConfig) -> dict:
     action = (decision or {}).get("action", "reject")
     revised = (decision or {}).get("revised_answer") or ""
     if action == "approve":
-        return {"review_status": "approved"}
+        # 通过：给患者返回精简版（推荐科室 + 就医建议，不含分诊依据）；无精简版则回退完整草稿
+        patient_text = state.get("patient_summary") or draft
+        return {"review_status": "approved", "messages": [AIMessage(content=patient_text)]}
     if action == "revise":
         # 改写：追加新 AIMessage（边界按最后一条 AI 取内容时以改写版为准）
         return {"review_status": "revised", "messages": [AIMessage(content=revised)]}

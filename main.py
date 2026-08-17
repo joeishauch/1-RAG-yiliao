@@ -154,6 +154,11 @@ def format_response(response):
     return '\n\n'.join(formatted_paragraphs)
 
 
+# 待人工审核队列：thread_id -> {thread_id, userId, conversationId, risk_level, draft, safety_hits}
+# 由 handle_non_stream_response 入队、review_resume 出队、GET /v1/review/pending 读取
+pending_queue = {}
+
+
 def _extract_last_ai_content(state: dict) -> Optional[str]:
     """逆序遍历 state 的消息，取最后一条有 content 的 AI 消息。
 
@@ -295,6 +300,15 @@ async def handle_non_stream_response(user_input, graph, tool_config, config, red
                     risk_level=payload.get("risk_level"), draft=payload.get("draft"),
                     redacted=redaction_count > 0, redaction_count=redaction_count,
                 ))
+                # 入待审队列（供医生端 GET /v1/review/pending 拉取）
+                pending_queue[thread_id] = {
+                    "thread_id": thread_id,
+                    "userId": config["configurable"]["user_id"],
+                    "conversationId": thread_id.split("@@", 1)[1] if "@@" in thread_id else thread_id,
+                    "risk_level": payload.get("risk_level"),
+                    "draft": payload.get("draft", ""),
+                    "safety_hits": payload.get("safety_hits", []),
+                }
                 return JSONResponse(content=ReviewPendingResponse(
                     thread_id=thread_id,
                     user_id=user_id,
@@ -450,7 +464,10 @@ async def handle_stream_response(user_input, graph, config):
             # 流结束：兜底检测是否有未处理的中断（HITL），有则产出 pending 事件（完整流式 HITL 归二期）
             try:
                 graph_state = graph.get_state(config)
-                interrupts = getattr(graph_state, "interrupts", None)
+                interrupts = tuple(
+                    it for task in (getattr(graph_state, "tasks", ()) or ())
+                    for it in (getattr(task, "interrupts", ()) or ())
+                )
                 if interrupts:
                     payload = interrupts[0].value if interrupts else {}
                     yield f"data: {json.dumps({'status': 'pending_review', 'thread_id': config['configurable']['thread_id'], 'risk_level': payload.get('risk_level'), 'draft': payload.get('draft', '')})}\n\n"
@@ -563,6 +580,8 @@ async def review_resume(request: ReviewRequest, dependencies: Tuple[any, any] = 
         # 续跑：无需重传 input，checkpoint 已存 state；返回最终 state
         final_state = graph.invoke(Command(resume=decision), config)
         final_content = _extract_last_ai_content(final_state)
+        # 审核完成，出待审队列
+        pending_queue.pop(thread_id, None)
 
         # 出口诊断性表述检测
         if final_content:
@@ -575,9 +594,11 @@ async def review_resume(request: ReviewRequest, dependencies: Tuple[any, any] = 
             action=request.action, revised_answer=request.revised_answer,
             reviewer=request.reviewer, comment=request.comment,
         ))
+        # 从最终 state 取风险等级，补进 final 审计记录，便于追溯高中低风险
+        risk_level = final_state.get("risk_level") if isinstance(final_state, dict) else None
         write_audit(build_record(
             event="final", thread_id=thread_id, user_id=request.userId,
-            final_answer=final_content,
+            risk_level=risk_level, final_answer=final_content,
         ))
 
         return JSONResponse(content=ChatCompletionResponse(
@@ -590,6 +611,37 @@ async def review_resume(request: ReviewRequest, dependencies: Tuple[any, any] = 
     except Exception as e:
         logger.error(f"Error handling review resume: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/v1/review/pending")
+async def review_pending(dependencies: Tuple[any, any] = Depends(get_dependencies)):
+    """返回待人工审核队列（医生端拉取）。"""
+    return JSONResponse(content={"items": list(pending_queue.values())})
+
+
+@app.get("/v1/chat/state")
+async def chat_state(userId: str, conversationId: str, dependencies: Tuple[any, any] = Depends(get_dependencies)):
+    """查询会话最新状态：待审核（pending）或已完成（done，含最终回答）。"""
+    graph, _ = dependencies
+    thread_id = f"{userId}@@{conversationId}"
+    config = {"configurable": {"thread_id": thread_id, "user_id": userId}}
+    try:
+        snap = graph.get_state(config)
+        # langgraph 0.2.74 的 StateSnapshot 没有 interrupts 字段，interrupt 信息在 tasks[].interrupts 里
+        interrupts = tuple(
+            it for task in (getattr(snap, "tasks", ()) or ())
+            for it in (getattr(task, "interrupts", ()) or ())
+        )
+        if interrupts:
+            return JSONResponse(content={"status": "pending"})
+        values = getattr(snap, "values", {}) or {}
+        content = _extract_last_ai_content(values)
+        if content:
+            return JSONResponse(content={"status": "done", "content": content})
+        return JSONResponse(content={"status": "done", "content": "（无回复）"})
+    except Exception as e:
+        logger.error(f"Error querying chat state: {e}")
+        return JSONResponse(content={"status": "error", "detail": str(e)})
 
 
 if __name__ == "__main__":
