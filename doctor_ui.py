@@ -33,6 +33,11 @@ review_url = "http://localhost:8012/v1/chat/review"
 pending_url = "http://localhost:8012/v1/review/pending"
 login_url = "http://localhost:8012/v1/doctor/login"
 register_url = "http://localhost:8012/v1/doctor/register"
+list_url = "http://localhost:8012/v1/doctor/list"
+delete_url = "http://localhost:8012/v1/doctor/delete"
+update_url = "http://localhost:8012/v1/doctor/update"
+reset_request_url = "http://localhost:8012/v1/doctor/reset_request"
+reset_confirm_url = "http://localhost:8012/v1/doctor/reset_confirm"
 # 定义 HTTP 请求头，指定内容类型为 JSON
 headers = {"Content-Type": "application/json"}
 
@@ -56,6 +61,9 @@ session = {
 
 # 待审队列缓存：thread_id -> 待审项（含 userId/conversationId/risk_level/draft/safety_hits/current_department）
 queue_cache = {}
+
+# 医生名单缓存：phone -> {name, title, department}，管理员刷新名单时更新，选中时回填编辑表单
+doctor_cache = {}
 
 
 def format_response(full_text):
@@ -227,6 +235,133 @@ def register_doctor(name, phone, password, title, department):
     return f"❌ {data.get('detail', '建号失败')}"
 
 
+def list_doctors():
+    """管理员拉取全部医生名单，返回 Dataframe 表格、下拉选项与状态。"""
+    if not session.get("is_admin"):
+        return gr.update(), gr.update(), "❌ 仅管理员可查看名单"
+    params = {"admin_account": session.get("account"), "admin_password": session.get("password")}
+    try:
+        resp = requests.get(list_url, params=params, timeout=10)
+        data = resp.json()
+    except Exception as e:
+        return gr.update(), gr.update(), f"❌ 拉取失败：{e}"
+    if not data.get("ok"):
+        return gr.update(), gr.update(), f"❌ {data.get('detail', '拉取失败')}"
+    doctors = data.get("doctors", [])
+    rows = [
+        [d["phone"], d["name"], d["title"] or "—", d["department"] or "管理员", "是" if d["is_admin"] else "否"]
+        for d in doctors
+    ]
+    # 管理员不参与增删改查；其余医生填入下拉 + 缓存（选中时回填编辑表单）
+    doctor_cache.clear()
+    phones = []
+    for d in doctors:
+        if not d["is_admin"]:
+            phones.append(d["phone"])
+            doctor_cache[d["phone"]] = {"name": d["name"], "title": d["title"], "department": d["department"]}
+    return (
+        gr.update(value=rows),
+        gr.update(choices=phones, value=phones[0] if phones else None),
+        f"共 {len(doctors)} 个账号（含管理员），医生 {len(phones)} 人",
+    )
+
+
+def fill_edit_form(phone):
+    """选中医生时，把姓名/职称/科室回填到编辑表单。"""
+    d = doctor_cache.get(phone)
+    if not d:
+        return gr.update(), gr.update(), gr.update()
+    return gr.update(value=d["name"]), gr.update(value=d["title"]), gr.update(value=d["department"])
+
+
+def update_doctor(phone, name, title, department):
+    """管理员改医生资料（姓名/职称/科室）。"""
+    if not phone:
+        return "❌ 请先选择要编辑的医生"
+    if not name or not department:
+        return "❌ 姓名 / 科室必填"
+    payload = {
+        "admin_account": session.get("account"),
+        "admin_password": session.get("password"),
+        "phone": phone,
+        "name": name,
+        "title": title or None,
+        "department": department,
+    }
+    try:
+        resp = requests.post(update_url, headers=headers, data=json.dumps(payload), timeout=10)
+        data = resp.json()
+    except Exception as e:
+        return f"❌ 更新失败：{e}"
+    if data.get("ok"):
+        return f"✅ 已更新 {phone}"
+    return f"❌ {data.get('detail', '更新失败')}"
+
+
+def delete_doctor(phone):
+    """管理员删除医生账号。"""
+    if not phone:
+        return "❌ 请先选择要删除的医生"
+    payload = {
+        "admin_account": session.get("account"),
+        "admin_password": session.get("password"),
+        "phone": phone,
+    }
+    try:
+        resp = requests.post(delete_url, headers=headers, data=json.dumps(payload), timeout=10)
+        data = resp.json()
+    except Exception as e:
+        return f"❌ 删除失败：{e}"
+    if data.get("ok"):
+        return f"✅ 已删除 {phone}"
+    return f"❌ {data.get('detail', '删除失败')}"
+
+
+def request_reset(phone):
+    """管理员发起密码重置：返回一次性链接（本地模拟短信下发）。"""
+    if not phone:
+        return "❌ 请先选择要重置密码的医生"
+    payload = {
+        "admin_account": session.get("account"),
+        "admin_password": session.get("password"),
+        "phone": phone,
+    }
+    try:
+        resp = requests.post(reset_request_url, headers=headers, data=json.dumps(payload), timeout=10)
+        data = resp.json()
+    except Exception as e:
+        return f"❌ 重置申请失败：{e}"
+    if data.get("ok"):
+        return (
+            f"✅ 已生成一次性重置链接（{data.get('expires_in')} 秒内有效，用后即焚）：\n\n"
+            f"🔗 完整链接：{data.get('link')}\n\n"
+            f"🔑 重置 token（复制这串去登录页「忘记密码」输入）：\n`{data.get('reset_token')}`\n\n"
+            f"请转发给医生本人，由其自行设定新密码。"
+        )
+    return f"❌ {data.get('detail', '重置申请失败')}"
+
+
+def confirm_reset(token, new_password):
+    """医生自助：用一次性 token 设定新密码（登录页「忘记密码」入口）。"""
+    token = (token or "").strip()
+    # 容错：用户可能直接粘贴了完整链接，自动提取 reset_token= 后面的那串
+    if "reset_token=" in token:
+        token = token.split("reset_token=", 1)[1].split("&")[0].strip()
+    if not token:
+        return "❌ 请输入重置 token（链接里 reset_token= 后面的那串）"
+    if not new_password or len(new_password) < 6:
+        return "❌ 新密码至少 6 位"
+    payload = {"token": token, "new_password": new_password}
+    try:
+        resp = requests.post(reset_confirm_url, headers=headers, data=json.dumps(payload), timeout=10)
+        data = resp.json()
+    except Exception as e:
+        return f"❌ 重置失败：{e}"
+    if data.get("ok"):
+        return f"✅ 密码已重置，请用手机号 + 新密码登录（账号 {data.get('phone')}）"
+    return f"❌ {data.get('detail', '重置失败')}"
+
+
 # 使用 Gradio Blocks 创建医生端界面
 with gr.Blocks(title="智能分诊 · 医生审核端") as demo:
     # 登录页（初始可见）
@@ -236,6 +371,12 @@ with gr.Blocks(title="智能分诊 · 医生审核端") as demo:
         password_input = gr.Textbox(label="密码", type="password", placeholder="请输入密码")
         login_btn = gr.Button("登录", variant="primary")
         login_msg = gr.Markdown("")
+        # 忘记密码：管理员发起重置后，医生用一次性 token 自助设密
+        with gr.Accordion("忘记密码？", open=False):
+            reset_token_input = gr.Textbox(label="重置 token（管理员发起，由短信/线下转发）")
+            reset_new_pw = gr.Textbox(label="新密码", type="password")
+            reset_confirm_btn = gr.Button("设定新密码", variant="secondary")
+            reset_confirm_msg = gr.Markdown("")
 
     # 主界面（初始隐藏）
     with gr.Column(visible=False) as main_page:
@@ -254,6 +395,25 @@ with gr.Blocks(title="智能分诊 · 医生审核端") as demo:
             new_department = gr.Dropdown(label="绑定科室（权限）", choices=DEPARTMENTS, interactive=True)
             register_btn = gr.Button("创建账号", variant="primary")
             register_msg = gr.Markdown("")
+
+            # 医生名单（增删改查 + 密码重置）
+            gr.Markdown("---\n### 📋 医生名单（增删改查）")
+            doctor_list_btn = gr.Button("刷新名单", variant="secondary")
+            doctor_table = gr.Dataframe(
+                headers=["手机号", "姓名", "职称", "科室", "管理员"],
+                datatype=["str", "str", "str", "str", "str"],
+                interactive=False,
+            )
+            manage_phone = gr.Dropdown(label="选择医生（手机号）", choices=[], interactive=True)
+            with gr.Row():
+                edit_name = gr.Textbox(label="姓名")
+                edit_title = gr.Textbox(label="职称")
+                edit_department = gr.Dropdown(label="科室", choices=DEPARTMENTS, interactive=True)
+            with gr.Row():
+                save_edit_btn = gr.Button("💾 保存修改", variant="primary")
+                delete_btn = gr.Button("🗑 删除账号", variant="secondary")
+                reset_btn = gr.Button("🔗 重置密码", variant="secondary")
+            manage_msg = gr.Markdown("")
 
         with gr.Row():
             refresh_btn = gr.Button("刷新队列", variant="primary")
@@ -294,6 +454,14 @@ with gr.Blocks(title="智能分诊 · 医生审核端") as demo:
     transfer_btn.click(transfer_item, [transfer_dropdown, pending_dropdown], [result_box, pending_dropdown])
     # 绑定管理员建号按钮
     register_btn.click(register_doctor, [new_name, new_phone, new_password, new_title, new_department], [register_msg])
+    # 医生名单：刷新 / 选中回填 / 保存 / 删除 / 重置密码
+    doctor_list_btn.click(list_doctors, None, [doctor_table, manage_phone, manage_msg])
+    manage_phone.change(fill_edit_form, [manage_phone], [edit_name, edit_title, edit_department])
+    save_edit_btn.click(update_doctor, [manage_phone, edit_name, edit_title, edit_department], [manage_msg])
+    delete_btn.click(delete_doctor, [manage_phone], [manage_msg])
+    reset_btn.click(request_reset, [manage_phone], [manage_msg])
+    # 忘记密码：一次性 token 换新密码
+    reset_confirm_btn.click(confirm_reset, [reset_token_input, reset_new_pw], [reset_confirm_msg])
 
 
 if __name__ == "__main__":

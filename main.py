@@ -126,6 +126,32 @@ class DoctorRegisterRequest(BaseModel):
     title: Optional[str] = None      # 职称（可选）
     department: str                  # 绑定科室（权限）
 
+# 管理员改医生资料请求（可改姓名/职称/科室，不可改手机号——手机号即账号）
+class DoctorUpdateRequest(BaseModel):
+    admin_account: str = "admin"
+    admin_password: str
+    phone: str
+    name: str
+    title: Optional[str] = None
+    department: str
+
+# 管理员删除医生账号请求
+class DoctorDeleteRequest(BaseModel):
+    admin_account: str = "admin"
+    admin_password: str
+    phone: str
+
+# 管理员发起密码重置请求（不生成新密码，只发一次性 token 让医生自助设密）
+class DoctorResetRequest(BaseModel):
+    admin_account: str = "admin"
+    admin_password: str
+    phone: str
+
+# 医生自助确认重置（token + 新密码，无需登录）
+class DoctorResetConfirmRequest(BaseModel):
+    token: str
+    new_password: str
+
 # 定义ChatCompletionResponseChoice类
 class ChatCompletionResponseChoice(BaseModel):
     index: int
@@ -192,6 +218,13 @@ DOCTOR_ACCOUNTS_FILE = "output/doctor_accounts.json"
 TRIAGE_FEEDBACK_FILE = "output/triage_feedback.jsonl"
 # 手机号正则（医生/患者账号统一：1 开头，第二位 3-9）
 PHONE_RE = re.compile(r"^1[3-9]\d{9}$")
+
+# 密码重置一次性 token：token -> {phone, expires_at}，管理员发起后医生自助设密
+# 内存态、10 分钟过期、用后即焚（管理员全程接触不到明文密码，见 /v1/doctor/reset_*）
+RESET_TOKEN_TTL = 600
+# 重置链接落盘文件（本地模拟「短信下发」，线上替换为真实短信网关）
+RESET_LINKS_FILE = "output/reset_links.log"
+reset_tokens = {}
 
 # 医生账号内存缓存：account -> {salt, password_hash, name, title, department, is_admin}
 # 启动时从 doctor_accounts.json 加载；管理员建号后写回文件
@@ -798,6 +831,137 @@ async def doctor_register(request: DoctorRegisterRequest):
     }
     _save_doctor_accounts()
     return JSONResponse(content={"ok": True, "phone": request.phone})
+
+
+# ============================================================
+# 医生账号管理（仅管理员）：名单 / 删除 / 改资料 / 密码重置
+# ============================================================
+
+def _auth_admin(admin_account: str, admin_password: str):
+    """校验管理员身份，返回 (admin_record, error_detail)。"""
+    admin = doctor_accounts.get(admin_account)
+    if not admin or not admin.get("is_admin"):
+        return None, "无管理权限"
+    if _hash_password(admin_password, admin["salt"]) != admin["password_hash"]:
+        return None, "管理员密码错误"
+    return admin, None
+
+
+def _doctor_public(phone: str) -> dict:
+    """剥离敏感字段（salt/password_hash），返回医生可公开资料。"""
+    acct = doctor_accounts[phone]
+    return {
+        "phone": phone,
+        "name": acct.get("name", ""),
+        "title": acct.get("title", ""),
+        "department": acct.get("department"),
+        "is_admin": bool(acct.get("is_admin", False)),
+    }
+
+
+def _send_sms(phone: str, link: str) -> None:
+    """（模拟）发送密码重置链接到医生手机号。
+
+    本地无短信网关，用落盘 + 日志模拟「短信下发」；线上替换为真实短信网关
+    （阿里云 / 腾讯云短信 API），函数签名不变。
+    """
+    try:
+        os.makedirs(os.path.dirname(RESET_LINKS_FILE), exist_ok=True)
+        with open(RESET_LINKS_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(
+                {"phone": phone, "link": link, "expires_in": RESET_TOKEN_TTL},
+                ensure_ascii=False,
+            ) + "\n")
+    except OSError as e:
+        logger.error(f"写重置链接日志失败：{e}")
+    logger.info(f"[模拟短信] 医生 {phone} 密码重置链接：{link}")
+
+
+@app.get("/v1/doctor/list")
+async def doctor_list(admin_account: str, admin_password: str):
+    """管理员查看全部医生名单（不含密码哈希），管理员排最前、其余按科室 + 手机号排序。"""
+    _, err = _auth_admin(admin_account, admin_password)
+    if err:
+        return JSONResponse(content={"ok": False, "detail": err}, status_code=403)
+    doctors = [_doctor_public(p) for p in doctor_accounts]
+    doctors.sort(key=lambda d: (0 if d["is_admin"] else 1, d["department"] or "管理", d["phone"]))
+    return JSONResponse(content={"ok": True, "doctors": doctors})
+
+
+@app.post("/v1/doctor/delete")
+async def doctor_delete(request: DoctorDeleteRequest):
+    """管理员删除医生账号（admin 自身不可删）。"""
+    _, err = _auth_admin(request.admin_account, request.admin_password)
+    if err:
+        return JSONResponse(content={"ok": False, "detail": err}, status_code=403)
+    if request.phone == "admin":
+        return JSONResponse(content={"ok": False, "detail": "管理员账号不可删除"}, status_code=400)
+    if request.phone not in doctor_accounts:
+        return JSONResponse(content={"ok": False, "detail": "该账号不存在"}, status_code=404)
+    doctor_accounts.pop(request.phone)
+    _save_doctor_accounts()
+    return JSONResponse(content={"ok": True, "phone": request.phone})
+
+
+@app.post("/v1/doctor/update")
+async def doctor_update(request: DoctorUpdateRequest):
+    """管理员改医生资料（姓名/职称/科室）；手机号即账号，故不可改，密码走 reset。"""
+    _, err = _auth_admin(request.admin_account, request.admin_password)
+    if err:
+        return JSONResponse(content={"ok": False, "detail": err}, status_code=403)
+    acct = doctor_accounts.get(request.phone)
+    if not acct:
+        return JSONResponse(content={"ok": False, "detail": "该账号不存在"}, status_code=404)
+    if not request.name.strip():
+        return JSONResponse(content={"ok": False, "detail": "姓名必填"}, status_code=400)
+    if request.department not in DEPARTMENTS:
+        return JSONResponse(content={"ok": False, "detail": f"科室须为 {DEPARTMENTS} 之一"}, status_code=400)
+    acct["name"] = request.name.strip()
+    acct["title"] = request.title or ""
+    acct["department"] = request.department
+    _save_doctor_accounts()
+    return JSONResponse(content={"ok": True, "phone": request.phone})
+
+
+@app.post("/v1/doctor/reset_request")
+async def doctor_reset_request(request: DoctorResetRequest):
+    """管理员发起密码重置：只发一次性 token，不生成新密码、不接触明文。"""
+    _, err = _auth_admin(request.admin_account, request.admin_password)
+    if err:
+        return JSONResponse(content={"ok": False, "detail": err}, status_code=403)
+    if request.phone not in doctor_accounts or request.phone == "admin":
+        return JSONResponse(content={"ok": False, "detail": "账号不存在或不可重置"}, status_code=404)
+    token = secrets.token_urlsafe(32)
+    reset_tokens[token] = {"phone": request.phone, "expires_at": time.time() + RESET_TOKEN_TTL}
+    link = f"http://127.0.0.1:7861/?reset_token={token}"
+    _send_sms(request.phone, link)
+    return JSONResponse(content={
+        "ok": True, "phone": request.phone,
+        "reset_token": token, "link": link, "expires_in": RESET_TOKEN_TTL,
+    })
+
+
+@app.post("/v1/doctor/reset_confirm")
+async def doctor_reset_confirm(request: DoctorResetConfirmRequest):
+    """医生自助设新密码：校验一次性 token 后重算哈希，token 用后即焚。"""
+    record = reset_tokens.get(request.token)
+    if not record:
+        return JSONResponse(content={"ok": False, "detail": "链接无效或已使用"}, status_code=400)
+    if time.time() > record["expires_at"]:
+        reset_tokens.pop(request.token, None)
+        return JSONResponse(content={"ok": False, "detail": "链接已过期，请重新申请"}, status_code=400)
+    if len(request.new_password) < 6:
+        return JSONResponse(content={"ok": False, "detail": "新密码至少 6 位"}, status_code=400)
+    phone = record["phone"]
+    if phone not in doctor_accounts:
+        reset_tokens.pop(request.token, None)
+        return JSONResponse(content={"ok": False, "detail": "账号不存在"}, status_code=404)
+    salt = secrets.token_hex(16)
+    doctor_accounts[phone]["salt"] = salt
+    doctor_accounts[phone]["password_hash"] = _hash_password(request.new_password, salt)
+    _save_doctor_accounts()
+    reset_tokens.pop(request.token, None)  # 一次性，用后即焚
+    return JSONResponse(content={"ok": True, "phone": phone})
 
 
 @app.get("/v1/chat/state")
