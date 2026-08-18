@@ -94,7 +94,6 @@ agent（ReAct，选择工具）──► call_tools（ParallelToolNode 并行执
 ├── hospital_mcp_server.py   # 方向2：模拟医院 HIS 的 MCP Server（外部系统）
 ├── mcp_client.py            # 方向2：MCP → LangChain 工具适配器（event loop 桥接）
 ├── verify_mcp.py            # MCP 双方向集成验证
-├── MCP集成方案.md           # MCP 双方向集成方案文档
 ├── webUI.py                 # Gradio 患者端（7860）
 ├── doctor_ui.py             # Gradio 医生审核端（7861）
 ├── app_launcher.py          # 一键启动器
