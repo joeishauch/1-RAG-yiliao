@@ -6,7 +6,7 @@
 
 ## ✨ 核心能力
 
-### 四条问答链路
+### 五条问答链路
 
 | 链路 | 用户意图示例 | 工具 | 图流程 | 风险 |
 |---|---|---|---|---|
@@ -14,6 +14,13 @@
 | 症状推疾病 | 「胸痛可能是什么病」 | `kg_query` | agent → call_tools → generate_kg | 🟡 中 |
 | 用药禁忌 | 「阿司匹林有什么禁忌」 | `drug_taboo` | agent → call_tools → generate_drug | 🔴 高 |
 | 疾病科普 | 「什么是高血压」 | `medical_qa` | agent → call_tools → generate_qa | 🟢 低 |
+| 医院实时查询 | 「耳鼻喉科还有号吗」 | `query_registration` 等（MCP 接入 HIS） | agent → call_tools → generate_his | 🟢 低 |
+
+### MCP 工具生态（双方向）
+
+- **方向 1（对外提供）**：把 `retrieve` / `kg_query` / `medical_qa` / `drug_taboo` 4 个领域工具标准化为 MCP Server（`mcp_server.py`），外部系统通过统一协议复用，零重构。
+- **方向 2（对内消费）**：自研轻量 MCP → LangChain 适配器（`mcp_client.py`，MCP SDK + 后台 event loop 桥接 async→sync），把医院 HIS 系统（`hospital_mcp_server.py`，查号源 / 查报告）以 MCP 协议并入 LangGraph 工具链路，作为第 5 条链路独立路由到 `generate_his`。
+- **工程健壮性**：HIS 工具模块级单例懒加载（持有 bridge 引用防 GC），加载失败自动降级不影响主链路；`MCP_HIS_ENABLED` 一键开关。
 
 ### 安全合规 + 人在回路（HITL）
 
@@ -71,6 +78,7 @@ agent（ReAct，选择工具）──► call_tools（ParallelToolNode 并行执
 | 知识图谱 | networkx 内存图，症状 → 疾病 → 治疗 / 药物 / 科室 多跳推理 |
 | 存储 | PostgreSQL（checkpoint + 长期记忆） |
 | 服务 | FastAPI（OpenAI 兼容接口，端口 8012）+ Gradio 患者端（7860）/ 医生审核端（7861） |
+| Agent 协议 | MCP（Model Context Protocol）—— 4 工具暴露为 MCP Server + Agent 经 MCP 接入外部 HIS |
 | 配置 | pydantic-settings 集中管理（`.env`） |
 
 ---
@@ -81,7 +89,12 @@ agent（ReAct，选择工具）──► call_tools（ParallelToolNode 并行执
 .
 ├── main.py                  # FastAPI 服务 + HITL review 端点
 ├── ragAgent.py              # LangGraph 状态图（节点/路由/编译）
-├── cli.py                   # 统一 CLI 入口（chat / serve / ui / eval）
+├── cli.py                   # 统一 CLI 入口（chat / serve / ui / eval / mcp）
+├── mcp_server.py            # 方向1：4 领域工具 → MCP Server（对外提供）
+├── hospital_mcp_server.py   # 方向2：模拟医院 HIS 的 MCP Server（外部系统）
+├── mcp_client.py            # 方向2：MCP → LangChain 工具适配器（event loop 桥接）
+├── verify_mcp.py            # MCP 双方向集成验证
+├── MCP集成方案.md           # MCP 双方向集成方案文档
 ├── webUI.py                 # Gradio 患者端（7860）
 ├── doctor_ui.py             # Gradio 医生审核端（7861）
 ├── app_launcher.py          # 一键启动器
@@ -94,7 +107,7 @@ agent（ReAct，选择工具）──► call_tools（ParallelToolNode 并行执
 │   ├── privacy.py           # 入口脱敏
 │   ├── safety.py            # 生成前/后规则校验（危险拦截/诊断检测）
 │   └── audit.py             # 审计日志
-├── prompts/                 # 6 个 prompt 模板（agent/consult/summarize/qa/kg/drug）
+├── prompts/                 # 7 个 prompt 模板（agent/consult/summarize/qa/kg/drug/his）
 ├── jsonl2chroma.py          # 数据集导入向量库
 ├── build_kg.py              # 知识图谱构建
 ├── extract_drug_contra.py   # 药物禁忌抽取
@@ -142,6 +155,8 @@ python doctor_ui.py                   # 启动医生审核端（http://127.0.0.1
 python cli.py eval retrieval          # 检索质量评估
 python cli.py eval judge --limit 20   # LLM-as-judge 分诊质量评估
 python cli.py eval e2e                # 端到端四链路回归
+python cli.py mcp                     # 启动 MCP Server（方向1：对外提供 4 领域工具）
+python cli.py mcp --his               # 启动医院 HIS MCP Server（方向2：外部系统 mock）
 ```
 
 ### 2. API 调用（含 HITL 三态）
@@ -175,6 +190,7 @@ curl http://127.0.0.1:8012/v1/chat/review \
 - **风险分级而非一刀切**：高风险阻断式审核、中风险直出、低风险直出（二期预留快速确认 / 抽样审计 / 置信度路由）。
 - **脱敏放边界、审计放边界**：入口脱敏保证 PII 不进图；审计不进 state，避免与 `interrupt()` 幂等冲突、避免 resume 重复记录。
 - **规则引擎 + prompt 软约束双保险**：`safety.py` 硬兜底（命中即拦）+ prompt 软约束（尽量不做），互补。
+- **MCP 双向集成而非单做**：MCP 是协议/基建，单做天花板低，焊进分诊项目——方向1（4 工具暴露成 MCP Server）+ 方向2（自研 client 适配器接入外部 HIS）。不用 `langchain-mcp-adapters`（会拉高 langchain-core、破坏 langgraph 0.2.74 旧生态），自写轻量 adapter 只依赖官方 mcp SDK；MCP 是 async 协议、LangGraph 工具同步执行，用后台线程常驻 event loop + `run_coroutine_threadsafe` 桥接。
 
 ---
 
@@ -210,5 +226,6 @@ curl http://127.0.0.1:8012/v1/chat/review \
 ## 🧪 测试与验证
 
 - `verify_*.py`：各模块独立验证（KG / 症状匹配 / 科普 / 用药 / 标签均衡），不依赖 PostgreSQL。
+- `verify_mcp.py`：MCP 双方向集成验证（方向1 连自建 server 调 retrieve + 方向2 bind HIS 工具看 LLM 调 query_registration）。
 - `eval_triage_retrieval.py` / `eval_triage_judge.py` / `e2e_regression.py`：检索 / 分诊质量 / 端到端评估。
 - 安全合规链路：危险拦截、脱敏、HITL 三态、审计留痕、开关（`HITL_ENABLED`）均已完成端到端验证。

@@ -10,8 +10,10 @@
 """
 import json
 import logging
+import sys
 import threading
 from collections import Counter
+from pathlib import Path
 
 import chromadb
 import jieba
@@ -286,6 +288,42 @@ def search_drug_taboo(drug_query, records):
     return [r for r in records if r.get("drug_name", "") and r["drug_name"] in q]
 
 
+# 医院 HIS MCP 工具（方向2：Agent 接入外部系统）的模块级缓存单例
+_his_tools = None
+_his_bridge = None
+_his_lock = threading.Lock()
+
+
+def get_his_tools():
+    """懒加载并缓存医院 HIS 系统的 MCP 工具（方向2：Agent 接入外部系统）。
+
+    通过自研 mcp_client 适配器连接 hospital_mcp_server.py（stdio），把
+    query_department / query_registration / query_lab_report 动态转成 LangChain 工具。
+    加载失败（MCP SDK 缺失 / server 起不来）时降级返回空列表，不阻断主链路。
+    _his_bridge 持有后台 event loop + ClientSession 引用，防 GC 导致 stdio 连接断开。
+    """
+    global _his_tools, _his_bridge
+    if _his_tools is None:
+        with _his_lock:
+            if _his_tools is None:
+                if not Config.MCP_HIS_ENABLED:
+                    logger.info("MCP HIS 接入已关闭（MCP_HIS_ENABLED=false），跳过")
+                    _his_tools = []
+                    return _his_tools
+                try:
+                    from mcp_client import load_mcp_tools
+                    _his_tools, _his_bridge = load_mcp_tools(
+                        "hospital-his",
+                        sys.executable,
+                        [str(Path(__file__).resolve().parent.parent / "hospital_mcp_server.py")],
+                    )
+                    logger.info(f"已接入外部 HIS 系统 {len(_his_tools)} 个 MCP 工具：{[t.name for t in _his_tools]}")
+                except Exception as e:
+                    logger.warning(f"MCP HIS 接入失败，降级为无外部系统（不影响主链路）: {e}")
+                    _his_tools = []
+    return _his_tools
+
+
 def get_tools(llm_embedding):
     """
     创建并返回工具列表
@@ -383,5 +421,5 @@ def get_tools(llm_embedding):
             lines.append(f"- 【{name}】{items}")
         return "\n".join(lines)
 
-    # 返回工具列表（分诊 + 科普 + 知识图谱推理 + 药物禁忌）
-    return [retrieve, medical_qa, kg_query, drug_taboo]
+    # 返回工具列表（分诊 + 科普 + 知识图谱推理 + 药物禁忌 + 外部 HIS 系统）
+    return [retrieve, medical_qa, kg_query, drug_taboo] + get_his_tools()

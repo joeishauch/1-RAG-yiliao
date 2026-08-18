@@ -74,6 +74,10 @@ class Settings(BaseSettings):
     PROMPT_TEMPLATE_TXT_QA: str = "prompts/prompt_template_qa.txt"  # 科普兜底回答
     PROMPT_TEMPLATE_TXT_KG: str = "prompts/prompt_template_kg.txt"  # 知识图谱症状→疾病推理回答
     PROMPT_TEMPLATE_TXT_DRUG: str = "prompts/prompt_template_drug.txt"  # 药物禁忌回答
+    PROMPT_TEMPLATE_TXT_HIS: str = "prompts/prompt_template_his.txt"  # 外部系统（HIS 号源/报告）查询回答
+
+    # ---- MCP 外部系统接入（方向2）----
+    MCP_HIS_ENABLED: bool = True   # 是否在 get_tools 时接入外部 HIS MCP 工具（默认开；.env 设 false 可关，加载失败自动降级）
 
     # ---- 安全合规 / HITL（人工审核）----
     HITL_ENABLED: bool = True               # 高风险链路人工审核开关（默认开启；.env 设 false 可关）

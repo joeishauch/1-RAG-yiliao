@@ -553,16 +553,21 @@ def summarize(state: MessagesState, llm_chat) -> dict:
         }
 
 
+# 外部系统（HIS）工具名集合：mcp_client 从 hospital_mcp_server 动态加载的 3 个工具
+HIS_TOOL_NAMES = {"query_department", "query_registration", "query_lab_report"}
+
+
 def route_after_tools(state: MessagesState) -> str:
-    """工具执行后的路由：区分分诊检索、知识图谱推理与科普问答。
+    """工具执行后的路由：区分分诊检索、知识图谱推理、科普问答与外部系统查询。
 
     分诊场景调用 retrieve → 进入会诊链路（consult → summarize）；
     知识图谱场景调用 kg_query → 进入知识图谱回答节点（generate_kg）；
     科普场景调用 medical_qa → 进入科普回答节点（generate_qa）；
-    药物禁忌场景调用 drug_taboo → 进入药物禁忌回答节点（generate_drug）。
+    药物禁忌场景调用 drug_taboo → 进入药物禁忌回答节点（generate_drug）；
+    外部系统场景调用 query_*（HIS 号源/报告）→ 进入外部系统回答节点（generate_his）。
 
     Returns:
-        str: 下一个节点名（"consult" / "generate_kg" / "generate_qa" / "generate_drug" / END）
+        str: 下一个节点名（"consult" / "generate_kg" / "generate_qa" / "generate_drug" / "generate_his" / END）
     """
     # 从后向前找最后一个带工具调用的 AIMessage，据此判断本次执行了哪些工具
     for msg in reversed(state["messages"]):
@@ -574,6 +579,8 @@ def route_after_tools(state: MessagesState) -> str:
                 return "generate_kg"
             if "drug_taboo" in names:
                 return "generate_drug"
+            if names & HIS_TOOL_NAMES:
+                return "generate_his"
             return "generate_qa"
     return END
 
@@ -646,6 +653,28 @@ def generate_drug(state: MessagesState, llm_chat) -> dict:
         return {"messages": [response], "risk_level": "high"}
     except (IndexError, KeyError) as e:
         logger.error(f"Message access error in generate_drug: {e}")
+        return {"messages": [{"role": "system", "content": "无法生成回答"}]}
+
+
+def generate_his(state: MessagesState, llm_chat) -> dict:
+    """外部系统回答节点：基于 MCP 接入的 HIS 工具查询结果（号源/报告），用 LLM 生成自然回答。
+
+    Args:
+        state: 当前对话状态（messages 末尾为 HIS 工具的查询结果）。
+        llm_chat: Chat 模型。
+
+    Returns:
+        dict: 含最终外部系统查询回答的消息状态。
+    """
+    logger.info("Generating HIS-based answer")
+    try:
+        question = get_latest_question(state)
+        context = state["messages"][-1].content
+        his_chain = create_chain(llm_chat, Config.PROMPT_TEMPLATE_TXT_HIS)
+        response = his_chain.invoke({"question": question, "context": context})
+        return {"messages": [response], "risk_level": "low"}
+    except (IndexError, KeyError) as e:
+        logger.error(f"Message access error in generate_his: {e}")
         return {"messages": [{"role": "system", "content": "无法生成回答"}]}
 
 
@@ -797,6 +826,8 @@ def create_graph(db_connection_pool: ConnectionPool, llm_chat, llm_embedding, to
     workflow.add_node("generate_kg", lambda state: generate_kg(state, llm_chat=llm_chat))
     # 添加药物禁忌回答节点：基于 drug_taboo 查询结果生成用药安全回答
     workflow.add_node("generate_drug", lambda state: generate_drug(state, llm_chat=llm_chat))
+    # 添加外部系统回答节点：基于 MCP 接入的 HIS 工具查询结果生成回答
+    workflow.add_node("generate_his", lambda state: generate_his(state, llm_chat=llm_chat))
     # 添加高风险人工审核节点（summarize / generate_drug 之后触发）
     workflow.add_node("review", lambda state, config: review(state, config))
 
@@ -808,7 +839,7 @@ def create_graph(db_connection_pool: ConnectionPool, llm_chat, llm_embedding, to
     workflow.add_conditional_edges(
         source="call_tools",
         path=route_after_tools,
-        path_map={"consult": "consult", "generate_kg": "generate_kg", "generate_qa": "generate_qa", "generate_drug": "generate_drug", END: END},
+        path_map={"consult": "consult", "generate_kg": "generate_kg", "generate_qa": "generate_qa", "generate_drug": "generate_drug", "generate_his": "generate_his", END: END},
     )
     # 会诊完成后汇总
     workflow.add_edge(start_key="consult", end_key="summarize")
@@ -820,6 +851,8 @@ def create_graph(db_connection_pool: ConnectionPool, llm_chat, llm_embedding, to
     workflow.add_edge(start_key="generate_kg", end_key=END)
     # 药物禁忌回答后进入高风险审核（用药禁忌属高风险，需人工确认）
     workflow.add_edge(start_key="generate_drug", end_key="review")
+    # 外部系统查询回答后结束（低风险，无需审核）
+    workflow.add_edge(start_key="generate_his", end_key=END)
     # 审核后结束
     workflow.add_edge(start_key="review", end_key=END)
 

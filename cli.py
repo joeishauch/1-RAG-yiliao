@@ -12,6 +12,8 @@
     python cli.py eval retrieval       检索质量评估（Hit@K/MRR）
     python cli.py eval judge            LLM-as-judge 分诊质量评估
     python cli.py eval e2e             端到端四链路回归
+    python cli.py mcp                  启动 MCP Server（方向1：对外提供 4 领域工具）
+    python cli.py mcp --his            启动医院 HIS MCP Server（方向2 外部系统 mock）
 
 低频数据脚本（build_kg / jsonl2chroma / extract_drug_contra / run_label_audit）
 保持独立脚本，不收入此入口。
@@ -257,6 +259,17 @@ def cmd_eval_e2e(args):
     main()
 
 
+def cmd_mcp(args):
+    """启动 MCP Server（默认方向1：对外提供 4 领域工具；--his 起外部系统 mock）"""
+    if args.his:
+        from hospital_mcp_server import mcp
+        print("医院 HIS MCP Server 启动（方向2：外部系统 mock，stdio 传输）...", flush=True)
+    else:
+        from mcp_server import mcp
+        print("医疗分诊 MCP Server 启动（方向1：对外提供 4 领域工具，stdio 传输）...", flush=True)
+    mcp.run(show_banner=False)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="智能分诊系统 — 统一命令行入口",
@@ -270,6 +283,8 @@ def main():
   python cli.py eval retrieval       检索质量评估
   python cli.py eval judge --limit 5 LLM-as-judge 评估（5 条）
   python cli.py eval e2e             端到端四链路回归
+  python cli.py mcp                  启动 MCP Server（方向1：对外提供 4 工具）
+  python cli.py mcp --his            启动医院 HIS MCP Server（方向2 外部系统 mock）
         """,
     )
 
@@ -286,6 +301,10 @@ def main():
 
     # ui
     sub.add_parser("ui", help="启动 Gradio Web 界面")
+
+    # mcp
+    p_mcp = sub.add_parser("mcp", help="启动 MCP Server")
+    p_mcp.add_argument("--his", action="store_true", help="启动医院 HIS MCP Server（方向2 外部系统 mock）")
 
     # eval（二级子命令）
     p_eval = sub.add_parser("eval", help="质量评估")
@@ -316,6 +335,7 @@ def main():
             "chat": cmd_chat,
             "serve": cmd_serve,
             "ui": cmd_ui,
+            "mcp": cmd_mcp,
         }
         routes[args.command](args)
 
