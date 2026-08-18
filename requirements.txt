@@ -14,16 +14,17 @@ chromadb==0.5.23
 
 # ---- Web 服务 ----
 fastapi==0.141.1
+starlette==0.52.1     # 显式固定，避免 fastapi 无上界拉到 1.x 与 sse-starlette 冲突
 uvicorn==0.52.3
 gradio==5.32.1
 requests==2.32.3
 
 # ---- MCP（Model Context Protocol）----
 mcp==1.29.0            # 官方 MCP SDK（mcp_client：ClientSession / stdio_client）
-fastmcp==3.4.7         # FastMCP 框架（mcp_server / hospital_mcp_server：FastMCP）
+fastmcp-slim==3.4.7    # FastMCP 精简版（仅 stdio，不拉 starlette；mcp_server / hospital_mcp_server 用 FastMCP）
 
 # ---- 配置 ----
-pydantic==2.13.4
+pydantic==2.11.10
 pydantic-settings==2.9.1
 
 # ---- PostgreSQL ----
