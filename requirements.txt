@@ -12,10 +12,14 @@ langgraph
 chromadb
 
 # ---- Web 服务 ----
-fastapi
+fastapi>=0.141      # 需 >=0.141 才能兼容 MCP 引入的 starlette>=0.49.1
 uvicorn
 gradio
 requests
+
+# ---- MCP（Model Context Protocol）----
+mcp                 # 官方 MCP SDK（mcp_client：ClientSession / stdio_client）
+fastmcp             # FastMCP 框架（mcp_server / hospital_mcp_server：FastMCP）
 
 # ---- 配置 ----
 pydantic
