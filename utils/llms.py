@@ -43,7 +43,15 @@ MODEL_CONFIGS = {
         "embedding_model": "text-embedding-v1",
         "embedding_base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
         "embedding_api_key": settings.DASHSCOPE_API_KEY
-    }
+    },
+    "zhipu": {
+        # 智谱 GLM（OpenAI 兼容接口），替代 dashscope 省钱方案
+        # API key: https://open.bigmodel.cn/user-center/apikeys
+        "base_url": "https://open.bigmodel.cn/api/paas/v4/",
+        "api_key": settings.ZHIPU_API_KEY,
+        "chat_model": "glm-4-plus",
+        "embedding_model": "embedding-3"
+    },
 }
 
 # 默认配置
@@ -134,6 +142,62 @@ def get_llm(llm_type: str = DEFAULT_LLM_TYPE) -> tuple[ChatOpenAI, OpenAIEmbeddi
         if llm_type != DEFAULT_LLM_TYPE:
             return initialize_llm(DEFAULT_LLM_TYPE)
         raise
+
+
+def get_local_bge_embedding():
+    """加载本地 bge-m3 模型，返回 langchain Embeddings 兼容对象。
+
+    B.2 备选 embedding 源：完全本地，无 API 费用（替代 dashscope 省钱方案）。
+    模型维度 1024，最大输入 8192 token，对中文 + 英文术语都友好。
+
+    Returns:
+        langchain_core.embeddings.Embeddings 实例
+    """
+    from sentence_transformers import SentenceTransformer
+    from langchain_core.embeddings import Embeddings
+
+    path = settings.LOCAL_BGE_MODEL_PATH
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"本地 bge-m3 模型路径不存在: {path}")
+
+    logger.info(f"加载本地 bge-m3: {path}")
+    _st_model = SentenceTransformer(path)
+    logger.info(
+        f"bge-m3 已加载（dim={_st_model.get_embedding_dimension()}, "
+        f"max_seq_len={_st_model.max_seq_length}）"
+    )
+
+    class BGEEmbeddings(Embeddings):
+        def embed_documents(self, texts):
+            vecs = _st_model.encode(
+                texts, batch_size=25, normalize_embeddings=True, show_progress_bar=False
+            )
+            return vecs.tolist()
+
+        def embed_query(self, text):
+            vec = _st_model.encode(
+                [text], normalize_embeddings=True, show_progress_bar=False
+            )
+            return vec[0].tolist()
+
+    return BGEEmbeddings()
+
+
+def get_embedding(embedding_type: str = None):
+    """根据 embedding_type 选择 embedding 来源（独立于 chat 模型）。
+
+    Args:
+        embedding_type: "deepseek" / "zhipu" / "local_bge"，None 时用 settings.LLM_EMBEDDING_TYPE
+
+    Returns:
+        langchain Embeddings 实例（实现 embed_documents / embed_query）
+    """
+    embedding_type = embedding_type or settings.LLM_EMBEDDING_TYPE
+    if embedding_type == "local_bge":
+        return get_local_bge_embedding()
+    # 其它 provider 走 OpenAI 兼容接口（initialize_llm 返回 (chat, embedding) 元组）
+    _, embedding = initialize_llm(embedding_type)
+    return embedding
 
 
 if __name__ == "__main__":

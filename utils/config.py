@@ -19,13 +19,18 @@ class Settings(BaseSettings):
     )
 
     # ---- 大模型 ----
-    LLM_TYPE: str = "deepseek"      # openai / qwen / oneapi / ollama / deepseek
+    LLM_TYPE: str = "deepseek"      # openai / qwen / oneapi / ollama / deepseek / zhipu
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com/v1"
     DEEPSEEK_API_KEY: str = ""
     DEEPSEEK_MODEL: str = "deepseek-chat"
     DASHSCOPE_API_KEY: str = ""     # 通义 text-embedding-v1 向量
     OPENAI_BASE_URL: str = ""
     OPENAI_API_KEY: str = ""
+    ZHIPU_API_KEY: str = ""         # 智谱 GLM（OpenAI 兼容：chat=glm-4-plus, embedding=embedding-3）
+
+    # ---- Embedding 模型独立配置（B.2 备选：本地 bge-m3 替代 dashscope，0 费用）----
+    LLM_EMBEDDING_TYPE: str = "deepseek"  # deepseek / zhipu / local_bge
+    LOCAL_BGE_MODEL_PATH: str = "D:/ai/xtuner-env/大模型微调项目实战/demo_14/embedding_model/models/BAAI--bge-m3/snapshots/master"
 
     # ---- Chroma 向量库 ----
     CHROMADB_DIRECTORY: str = "chromaDB"
@@ -40,6 +45,12 @@ class Settings(BaseSettings):
 
     # ---- 分诊数据清洗 ----
     PER_LABEL_LIMIT: int = 3000   # 均衡抽样：分诊数据每科最多灌入条数（小科室全取、大科室均匀间隔）
+
+    # ---- 文档切片（B.2 真正切片：按句切分 + overlap，替代 MAX_DOC_LEN 硬截断）----
+    CHUNKING_ENABLED: bool = False  # 默认关闭，保留 A 阶段截断行为；启用后 jsonl2chroma / doc_sync 走按句切分
+    CHUNK_SIZE: int = 384          # 目标 chunk 大小（字）
+    CHUNK_OVERLAP: int = 48        # overlap 字数（与下一个 chunk 共享的尾部内容）
+    CHUNK_MIN_SIZE: int = 64       # 过小 chunk（< 此值）合并到上一个 chunk，避免碎片化
 
     # ---- 日志 ----
     LOG_FILE: str = "output/app.log"
@@ -84,6 +95,15 @@ class Settings(BaseSettings):
     REVIEW_REJECT_FALLBACK: str = "抱歉，该回复未通过安全审核，已拦截。如症状持续或加重，请及时就医。"
     AUDIT_LOG_PATH: str = "output/audit.jsonl"   # 审计日志（AI 输出 + 人工修改留痕）
     LOW_RISK_SAMPLE_RATE: float = 0.2       # 二期预留：低风险事后抽样审计比例
+
+    # ---- 文档同步（变更感知 + 同步）----
+    # 上线后源文件改动 → doc 级全删全重建 → 缓存失效 → 审计留痕
+    SYNC_MANIFEST_PATH: str = "output/sync_manifest.json"   # 原子写：先清 tmp 再写 tmp.pid → os.replace
+    SYNC_BATCH_SIZE: int = 25              # 与 jsonl2chroma.py BATCH_SIZE 对齐
+    SYNC_WEBHOOK_ENABLED: bool = True       # main.py 是否暴露 POST /v1/sync/trigger
+    SYNC_WEBHOOK_TOKEN: str = ""            # 共享密钥；空 token = 拒绝所有调用（fail-closed）
+    SYNC_LOCK_PATH: str = "output/sync.lock"        # 进程级文件锁路径
+    SYNC_STALE_LOCK_SECS: int = 1800        # 锁文件 mtime > 30 分钟视为 stale，强制解锁重试
 
 
 # 全局单例：模块 import 时即加载 .env 与环境变量
