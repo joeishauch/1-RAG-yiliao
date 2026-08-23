@@ -11,6 +11,9 @@ venv/
 # 向量库二进制（大文件）
 chromaDB/
 
+# ChromaDB 备份目录（A 阶段 sync 前备份，850MB-1.7GB，可手动重建）
+chromaDB.bak_*/
+
 # 知识图谱缓存（大文件，可重跑 build_kg.py 重建）
 kg_graph.pkl
 kg_symptom_index.pkl
@@ -22,6 +25,9 @@ graph.png
 
 # 评估报告
 eval_reports/
+
+# 个人面试笔记（含个人思路，不入公开 GitHub）
+*面试*.md
 
 # IDE
 .idea/
