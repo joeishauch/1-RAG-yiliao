@@ -252,21 +252,48 @@ def import_source(source, llm_embedding, dry_run=False, override_limit=None, ove
 
     documents, metadatas, ids = [], [], []
     count = 0
+    records_processed = 0  # B.2 fix: limit 按 records 数（不是 chunks 数）
+
+    # 同步方案 A.4：所有 chunk 统一打 doc_id（路径+大小规范化），doc_sync.py 用它做"doc 级全删全重建"
+    # 这里计算一次，循环里 setdefault；老库无 doc_id 用 --migrate 回填
+    from pathlib import Path as _Path
+    from doc_sync import compute_doc_id as _compute_doc_id
+    _file_path = _Path(source["file"])
+    _file_size = _file_path.stat().st_size
+    _doc_id = _compute_doc_id(_file_path, _file_size)
 
     for item in records_iter:
-        if limit is not None and count >= limit:
+        if limit is not None and records_processed >= limit:
             break
         parsed = item if balanced else _parse_valid(source, item)
         if parsed is None:
             continue
         document = parsed["document"].strip()
-        # 截断过长正文，避免超过 embedding 模型的输入上限（2048 token）
-        if len(document) > MAX_DOC_LEN:
-            document = document[:MAX_DOC_LEN]
-        documents.append(document)
-        metadatas.append(_clean_metadata(parsed["metadata"]))
-        ids.append(str(uuid.uuid4()))
-        count += 1
+        # B.2 切片：CHUNKING_ENABLED 时按句切分，否则按 MAX_DOC_LEN 硬截断
+        if Config.CHUNKING_ENABLED and len(document) > Config.CHUNK_SIZE:
+            from chunking import chunk_text
+            text_chunks = chunk_text(
+                document,
+                chunk_size=Config.CHUNK_SIZE,
+                overlap=Config.CHUNK_OVERLAP,
+                min_size=Config.CHUNK_MIN_SIZE,
+            )
+        elif len(document) > MAX_DOC_LEN:
+            from chunking import Chunk
+            text_chunks = [Chunk(text=document[:MAX_DOC_LEN], sentence_count=1)]
+        else:
+            from chunking import Chunk
+            text_chunks = [Chunk(text=document, sentence_count=1)]
+        records_processed += 1  # B.2 fix: 成功解析后 +1
+
+        for tc in text_chunks:
+            documents.append(tc.text)
+            meta = _clean_metadata(parsed["metadata"])
+            meta["doc_id"] = _doc_id  # 同步方案 A.4：doc 级定位标识
+            meta["sentence_count"] = tc.sentence_count  # B.2：每 chunk 句子数（审计 + 追溯）
+            metadatas.append(meta)
+            ids.append(str(uuid.uuid4()))
+            count += 1
 
     logger.info(f"[{name}] 解析完成，有效记录 {count} 条")
 

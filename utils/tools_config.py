@@ -245,6 +245,29 @@ def get_qa_context(llm_embedding):
     return _qa_ctx
 
 
+def invalidate_triage_cache() -> None:
+    """清空分诊检索上下文缓存（vectorstore + BM25 + prior）。
+
+    写入 ChromaDB 后调用：下一次 get_triage_context 会重建缓存，
+    保证运行中服务拿到的是新数据。
+
+    review 补强 #4：--rebuild 模式硬性顺序要求先调本函数再 delete_collection，
+    防止旧 vectorstore 继续命中空 collection。
+    """
+    global _triage_ctx
+    with _ctx_lock:
+        _triage_ctx = None
+    logger.info("分诊检索缓存已失效（_triage_ctx=None）")
+
+
+def invalidate_qa_cache() -> None:
+    """清空科普问答检索缓存（medical_qa vectorstore）。"""
+    global _qa_ctx
+    with _qa_lock:
+        _qa_ctx = None
+    logger.info("科普问答检索缓存已失效（_qa_ctx=None）")
+
+
 # 药物禁忌知识库的模块级缓存（drug_contraindications.json，纯 JSON 不依赖 embedding）
 _drug_ctx = None
 _drug_lock = threading.Lock()

@@ -9,7 +9,7 @@ from contextlib import asynccontextmanager
 # 用于类型提示，定义列表和可选参数
 from typing import List, Tuple
 # 用于创建Web应用和处理HTTP异常
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Header
 # 用于返回JSON和流式响应
 from fastapi.responses import JSONResponse, StreamingResponse
 # 用于运行FastAPI应用
@@ -29,6 +29,8 @@ import secrets
 from typing import Optional
 # 导入Pydantic的基类和字段定义工具
 from pydantic import BaseModel, Field
+# dataclasses.asdict 用于 webhook 返回 SyncResult 转 dict
+from dataclasses import asdict
 # 从自定义的库中引入函数
 from ragAgent import (
     ToolConfig,
@@ -987,6 +989,63 @@ async def chat_state(userId: str, conversationId: str, dependencies: Tuple[any, 
     except Exception as e:
         logger.error(f"Error querying chat state: {e}")
         return JSONResponse(content={"status": "error", "detail": str(e)})
+
+
+# ============================================================
+# 文档同步 webhook（同步方案 A.7）
+# ============================================================
+
+class SyncTriggerRequest(BaseModel):
+    """同步触发请求：source=all 同步全部；source=huatuo_lite 只同步该 source。"""
+    source: str = "all"
+    rebuild: bool = False
+    dry_run: bool = False
+    include_demo: bool = False  # review 补强 #10：--rebuild 默认排除 demo001
+
+
+def _require_sync_token(x_sync_token: Optional[str] = Header(None)) -> bool:
+    """webhook 鉴权：review 补强 #7，空 token 拒绝（fail-closed）。
+
+    调用端需带 header `X-Sync-Token: <token>`，缺失或错误返回 403。
+    生产建议换 OAuth2 / mTLS。
+    """
+    if not Config.SYNC_WEBHOOK_TOKEN:
+        raise HTTPException(403, "sync webhook disabled (empty token)")
+    if not x_sync_token or x_sync_token != Config.SYNC_WEBHOOK_TOKEN:
+        raise HTTPException(403, "invalid sync token")
+    return True
+
+
+@app.post("/v1/sync/trigger")
+async def sync_trigger(req: SyncTriggerRequest, _: bool = Depends(_require_sync_token)):
+    """Webhook 入口：被 GitHub Actions / 文件监听器 / cron 副作用调用。
+
+    - source="all" 时全量同步
+    - source="huatuo_lite" 时只同步该 source（其它 source 名同理）
+    - rebuild=True 时按 review 补强 #4 硬性顺序（失效缓存 → delete → add）
+    - include_demo=True 时 --rebuild 同时清 demo001（默认排除）
+    - dry_run=True 时只统计不写库
+    """
+    if not Config.SYNC_WEBHOOK_ENABLED:
+        raise HTTPException(503, "sync webhook disabled")
+    from doc_sync import acquire_sync_lock, sync_all
+    from jsonl2chroma import SOURCES
+    from utils.llms import get_embedding
+
+    # embedding 来源走 Config.LLM_EMBEDDING_TYPE（独立于 chat LLM_TYPE）
+    llm_embedding = get_embedding(Config.LLM_EMBEDDING_TYPE)
+    targets = [s for s in SOURCES if req.source in ("all", s["name"])]
+    if not targets:
+        raise HTTPException(400, f"未知 source: {req.source}（可选: {[s['name'] for s in SOURCES]}）")
+    with acquire_sync_lock():
+        results = sync_all(
+            targets,
+            llm_embedding,
+            dry_run=req.dry_run,
+            rebuild=req.rebuild,
+            include_demo=req.include_demo,
+        )
+    return JSONResponse(content={"ok": True, "results": [asdict(r) for r in results]})
 
 
 if __name__ == "__main__":

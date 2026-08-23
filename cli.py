@@ -21,6 +21,7 @@
 import argparse
 import os
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -244,6 +245,12 @@ def cmd_eval_retrieval(args):
     main()
 
 
+def cmd_eval_qa_retrieval(args):
+    """医疗问答检索质量评估（B.2 新建，32 用例）"""
+    from eval_qa_retrieval import main
+    main()
+
+
 def cmd_eval_judge(args):
     """LLM-as-judge 分诊质量评估（可选 --limit 限制用例数）"""
     from eval_triage_judge import main
@@ -268,6 +275,54 @@ def cmd_mcp(args):
         from mcp_server import mcp
         print("医疗分诊 MCP Server 启动（方向1：对外提供 4 领域工具，stdio 传输）...", flush=True)
     mcp.run(show_banner=False)
+
+
+def cmd_sync(args):
+    """文档同步：变更感知 → doc 级全删全重建 → 缓存失效 → 审计留痕。
+
+    支持 --once（默认）和 --watch（守护模式）；--migrate 一次性回填 doc_id。
+    进程级文件锁 acquire_sync_lock 包裹，并发 --watch 安全。
+    """
+    from doc_sync import acquire_sync_lock, run_migration, sync_all
+    from jsonl2chroma import SOURCES
+    from utils.llms import get_embedding
+
+    sources = [s for s in SOURCES if args.source is None or s["name"] in args.source]
+    if not sources:
+        print(f"未找到数据源。可选: {[s['name'] for s in SOURCES]}")
+        return
+
+    # dry-run 不需要 embedding；其它模式按 --embedding-type 选源（deepseek/zhipu/local_bge）
+    llm_embedding = None if args.dry_run else get_embedding(args.embedding_type)
+
+    # --migrate：一次性回填 doc_id 给存量无标识 chunk（不重 embed）
+    if args.migrate:
+        with acquire_sync_lock():
+            run_migration(sources, llm_embedding, args.manifest)
+        print(f"[migrate] 完成：{len(sources)} 个 source 已尝试回填 doc_id")
+        return
+
+    # --once / --watch 循环
+    while True:
+        with acquire_sync_lock():
+            results = sync_all(
+                sources,
+                llm_embedding,
+                dry_run=args.dry_run,
+                override_collection=args.collection,
+                rebuild=args.rebuild,
+                manifest_path=args.manifest,
+                include_demo=args.include_demo,
+            )
+        for r in results:
+            err = f" err={r.error}" if r.error else ""
+            print(
+                f"[{r.source}] status={r.status} inserted={r.inserted} "
+                f"deleted={r.deleted} duration={r.duration_s:.1f}s{err}"
+            )
+        if not args.watch:
+            break
+        time.sleep(args.interval)
 
 
 def main():
@@ -306,10 +361,26 @@ def main():
     p_mcp = sub.add_parser("mcp", help="启动 MCP Server")
     p_mcp.add_argument("--his", action="store_true", help="启动医院 HIS MCP Server（方向2 外部系统 mock）")
 
+    # sync（同步方案 A.6：变更感知+全删全重建+缓存失效）
+    p_sync = sub.add_parser("sync", help="文档同步（变更感知 → doc 级全删全重建 → 缓存失效）")
+    p_sync.add_argument("--source", action="append", default=None,
+                        help="指定 source 名（可重复；不传则全部）。可选: huatuo_lite / huatuo_encyclopedia / huatuo_knowledge_graph / chinese_medical_dialogue")
+    p_sync.add_argument("--collection", type=str, default=None, help="覆盖目标 collection（小样本验证灌到临时库）")
+    p_sync.add_argument("--dry-run", action="store_true", help="只统计变更不写库")
+    p_sync.add_argument("--rebuild", action="store_true", help="强制清空目标 collection 后重建（review 补强 #10：默认排除 demo001）")
+    p_sync.add_argument("--include-demo", action="store_true", help="--rebuild 时包含 demo001 子集（默认排除）")
+    p_sync.add_argument("--migrate", action="store_true", help="一次性回填 doc_id 给存量无标识 chunk（不重 embed）")
+    p_sync.add_argument("--manifest", type=str, default=None, help="自定义 manifest 路径")
+    p_sync.add_argument("--watch", action="store_true", help="守护模式：循环执行")
+    p_sync.add_argument("--interval", type=int, default=60, help="--watch 间隔秒数（默认 60）")
+    p_sync.add_argument("--embedding-type", type=str, default=None,
+                        help="embedding 来源：None=走 .env LLM_EMBEDDING_TYPE；deepseek/zhipu/local_bge")
+
     # eval（二级子命令）
     p_eval = sub.add_parser("eval", help="质量评估")
     p_eval_sub = p_eval.add_subparsers(dest="eval_type", help="评估类型")
-    p_eval_sub.add_parser("retrieval", help="检索质量评估（Hit@K/MRR）")
+    p_eval_sub.add_parser("retrieval", help="分诊检索质量评估（Hit@K/MRR，50 用例）")
+    p_eval_sub.add_parser("qa", help="医疗问答检索质量评估（medical_qa，32 用例）")
     p_eval_judge = p_eval_sub.add_parser("judge", help="LLM-as-judge 分诊质量评估")
     p_eval_judge.add_argument("--limit", type=int, default=None, help="评估用例数（默认全量）")
     p_eval_sub.add_parser("e2e", help="端到端四链路回归")
@@ -323,6 +394,7 @@ def main():
     if args.command == "eval":
         eval_routes = {
             "retrieval": cmd_eval_retrieval,
+            "qa": cmd_eval_qa_retrieval,
             "judge": cmd_eval_judge,
             "e2e": cmd_eval_e2e,
         }
@@ -336,6 +408,7 @@ def main():
             "serve": cmd_serve,
             "ui": cmd_ui,
             "mcp": cmd_mcp,
+            "sync": cmd_sync,
         }
         routes[args.command](args)
 
