@@ -29,6 +29,9 @@ eval_reports/
 # 个人面试笔记（含个人思路，不入公开 GitHub）
 *面试*.md
 
+# 临时脚本（以 _ 开头的本地调试/包装文件，不入 git）
+_*
+
 # IDE
 .idea/
 .ipynb_checkpoints/
