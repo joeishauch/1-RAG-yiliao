@@ -35,6 +35,9 @@ CONSULT_TOP_K = 10  # 会诊时每个科室检索的病例条数
 CONSULT_TOP_N = 3   # 参与深度会诊的科室数量（第二层）
 QA_TOP_K = 5        # 科普问答兜底：检索返回的相似问答条数
 
+# B.4：当前 embedding 模型过滤条件，检索时只返回同模型产生的 chunks
+_EMBED_MODEL_FILTER = {"embedding_model": Config.EMBEDDING_MODEL_ID}
+
 
 class HybridRetriever:
     """BM25 关键词 + 向量语义双路召回，RRF 融合 + cross-encoder 重排。
@@ -107,11 +110,11 @@ class HybridRetriever:
     def search(self, query, top_k=TRIAGE_TOP_K, mode="hybrid_rerank"):
         """混合检索，返回 Document 列表（含 label/answer metadata）。"""
         if mode == "vector":
-            return self.vectorstore.similarity_search(query, k=top_k)
+            return self.vectorstore.similarity_search(query, k=top_k, filter=_EMBED_MODEL_FILTER)
 
         # 双路召回
         bm25_hits = self._search_bm25(query, top_k=Config.HYBRID_BM25_TOP_K)
-        vec_docs = self.vectorstore.similarity_search(query, k=Config.HYBRID_VEC_TOP_K)
+        vec_docs = self.vectorstore.similarity_search(query, k=Config.HYBRID_VEC_TOP_K, filter=_EMBED_MODEL_FILTER)
 
         # RRF 融合（page_content 去重）
         doc_map = {}
@@ -268,6 +271,44 @@ def invalidate_qa_cache() -> None:
     logger.info("科普问答检索缓存已失效（_qa_ctx=None）")
 
 
+def invalidate_drug_cache() -> None:
+    """B.5：清空药物禁忌知识库缓存。下次 get_drug_context() 会重新读取 JSON 文件。"""
+    global _drug_ctx
+    with _drug_lock:
+        _drug_ctx = None
+    logger.info("药物禁忌缓存已失效（_drug_ctx=None）")
+
+
+# B.5：药物禁忌文件变更检测（mtime + size 快速比对）
+_drug_file_state: tuple[float, int] | None = None  # (mtime, size)
+
+
+def check_drug_contra_changes() -> bool:
+    """检查 drug_contraindications.json 是否被修改过。若变更则自动失效缓存。
+
+    Returns:
+        True 如果文件有变化（已自动失效缓存），False 如果无变化。
+    """
+    global _drug_file_state
+    path = Config.DRUG_CONTRA_PATH
+    try:
+        st = os.stat(path)
+        current = (st.st_mtime, st.st_size)
+    except OSError:
+        return False
+
+    if _drug_file_state is not None and current == _drug_file_state:
+        return False
+
+    # 文件有变化或首次检测
+    _drug_file_state = current
+    if _drug_ctx is not None:  # 已缓存过，需要失效
+        invalidate_drug_cache()
+        logger.info(f"药物禁忌文件已变更（mtime={current[0]:.0f}, size={current[1]}），缓存已失效")
+        return True
+    return False
+
+
 # 药物禁忌知识库的模块级缓存（drug_contraindications.json，纯 JSON 不依赖 embedding）
 _drug_ctx = None
 _drug_lock = threading.Lock()
@@ -394,7 +435,7 @@ def get_tools(llm_embedding):
     @tool
     def medical_qa(query: str) -> str:
         """医学知识问答工具：检索医学知识库，回答疾病、症状、用药、保健等科普类问题（非分诊/挂号咨询）。"""
-        docs = qa_vectorstore.similarity_search(query, k=QA_TOP_K)
+        docs = qa_vectorstore.similarity_search(query, k=QA_TOP_K, filter=_EMBED_MODEL_FILTER)
         if not docs:
             return "未检索到相关医学知识。"
 

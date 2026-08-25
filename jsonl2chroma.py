@@ -291,6 +291,7 @@ def import_source(source, llm_embedding, dry_run=False, override_limit=None, ove
             meta = _clean_metadata(parsed["metadata"])
             meta["doc_id"] = _doc_id  # 同步方案 A.4：doc 级定位标识
             meta["sentence_count"] = tc.sentence_count  # B.2：每 chunk 句子数（审计 + 追溯）
+            meta["embedding_model"] = Config.EMBEDDING_MODEL_ID  # B.4：标记产生该向量的 embedding 模型
             metadatas.append(meta)
             ids.append(str(uuid.uuid4()))
             count += 1

@@ -49,6 +49,7 @@ class SyncResult:
     deleted: int
     duration_s: float
     error: Optional[str] = None
+    kg_status: Optional[str] = None
 
 
 # ==================== 工具函数 ====================
@@ -202,6 +203,74 @@ def _emit_audit(event: str, source: str, doc_id: str, **fields) -> None:
         logger.warning(f"审计写入失败 event={event}: {e}")
 
 
+def _sync_kg_artifacts(
+    source_path: Path,
+    source_sha256: str,
+    *,
+    graph_path: str | None = None,
+    sample: int | None = None,
+) -> dict:
+    """让 KG 图和症状索引跟随 knowledge-graph 源版本更新。
+
+    图缓存按 source_sha256 自行判断是否需要重建；症状向量索引只失效进程内
+    单例，下一次模糊匹配时再按图版本懒加载，避免同步阶段重复发起 embedding。
+
+    graph_path / sample 允许覆盖（默认从 Config 读取），便于测试时隔离到临时路径。
+    """
+    started = time.time()
+    from utils.kg_builder import build_or_load, graph_cache_matches, load_graph
+
+    if graph_path is None:
+        graph_path = Config.KG_GRAPH_PATH
+    if sample is None:
+        sample = Config.KG_BUILD_SAMPLE if Config.KG_BUILD_SAMPLE > 0 else None
+    # 与 build_or_load 保持一致：sample<=0 视为全量（None）
+    if sample is not None and sample <= 0:
+        sample = None
+
+    cache_hit = False
+    if os.path.exists(graph_path):
+        try:
+            cache_hit = graph_cache_matches(
+                load_graph(graph_path),
+                source_sha256=source_sha256,
+                sample=sample,
+                source_path=source_path,
+            )
+        except Exception:
+            cache_hit = False
+
+    graph = build_or_load(
+        str(source_path),
+        graph_path,
+        sample=sample,
+        source_sha256=source_sha256,
+    )
+    if graph.graph.get("source_sha256") != source_sha256:
+        raise RuntimeError("KG 图构建完成但 source_sha256 校验失败")
+
+    # 缓存命中时跳过失效：图文件未变化，进程内单例仍有效，无需强制重载。
+    if not cache_hit:
+        from utils.kg_query import invalidate_kg_cache
+        from utils.kg_symptom_match import invalidate_symptom_index
+        invalidate_kg_cache()
+        invalidate_symptom_index()
+
+    status = "cached" if cache_hit else "rebuilt"
+    duration = round(time.time() - started, 2)
+    logger.info(
+        f"[KG] source_sha256={source_sha256[:12]} status={status} "
+        f"nodes={graph.number_of_nodes()} edges={graph.number_of_edges()} duration={duration}s"
+    )
+    return {
+        "status": status,
+        "source_sha256": source_sha256,
+        "nodes": graph.number_of_nodes(),
+        "edges": graph.number_of_edges(),
+        "duration_s": duration,
+    }
+
+
 # ==================== 核心算法 ====================
 
 def sync_source(
@@ -263,14 +332,28 @@ def sync_source(
         and prev.get("file_size") == file_size
         and prev.get("last_status") == "ok"
         and prev.get("chunk_count", 0) > 0
+        and prev.get("embedding_model") == Config.EMBEDDING_MODEL_ID  # B.4：模型变了不跳过
     ):
+        # B.3 修复：源未变化时仍检查 KG 构建产物是否缺失或过期，
+        # 避免 kg_graph.pkl 被误删/损坏后 sync_skip 导致 KG 永远不恢复。
+        kg_status = None
+        if name == "huatuo_knowledge_graph":
+            try:
+                kg_info = _sync_kg_artifacts(file_path, sha)
+                kg_status = kg_info["status"]
+                if kg_status != "cached":
+                    logger.info(f"[{name}] 源未变化但 KG 产物需要修复（status={kg_status}）")
+            except Exception as e:
+                logger.warning(f"[{name}] 源未变化但 KG 修复失败: {e}")
+
         duration = time.time() - start_ts
-        _emit_audit("sync_skip", name, new_doc_id, duration_s=round(duration, 2))
+        _emit_audit("sync_skip", name, new_doc_id,
+                    kg_status=kg_status, duration_s=round(duration, 2))
         logger.info(f"[{name}] 无变化（sha256+size+chunk_count 全匹配），跳过")
         return SyncResult(
             source=name, status="skipped", doc_id=new_doc_id,
             prev_doc_id=prev.get("doc_id"), inserted=0, deleted=0,
-            duration_s=duration,
+            duration_s=duration, kg_status=kg_status,
         )
 
     # 4. 取 prev_doc_id
@@ -320,6 +403,7 @@ def sync_source(
             meta["doc_id"] = new_doc_id
             meta.setdefault("source", name)
             meta["sentence_count"] = tc.sentence_count  # B.2：每 chunk 句子数
+            meta["embedding_model"] = Config.EMBEDDING_MODEL_ID  # B.4：标记产生该向量的 embedding 模型
             documents.append(tc.text)
             metadatas.append({k: v for k, v in meta.items() if v is not None})
             ids.append(uuid.uuid4().hex)
@@ -417,7 +501,48 @@ def sync_source(
             duration_s=duration, error=f"add 阶段异常: {e}",
         )
 
-    # 8. 原子更新 manifest
+    # 9. KG 联动：只有向量写入成功后才更新同源图缓存。
+    kg_status = None
+    if name == "huatuo_knowledge_graph":
+        try:
+            kg_info = _sync_kg_artifacts(file_path, sha)
+            kg_status = kg_info["status"]
+            _emit_audit(
+                "kg_sync",
+                name,
+                new_doc_id,
+                kg_status=kg_status,
+                source_sha256=sha,
+                nodes=kg_info["nodes"],
+                edges=kg_info["edges"],
+                duration_s=kg_info["duration_s"],
+            )
+        except Exception as e:
+            duration = time.time() - start_ts
+            _emit_audit(
+                "sync_error",
+                name,
+                new_doc_id,
+                error=f"KG 联动失败: {e}",
+                inserted=inserted,
+                deleted=deleted,
+                source_sha256=sha,
+                duration_s=round(duration, 2),
+            )
+            logger.exception(f"[{name}] 向量已写入，但 KG 联动失败")
+            return SyncResult(
+                source=name,
+                status="error",
+                doc_id=new_doc_id,
+                prev_doc_id=prev_doc_id,
+                inserted=inserted,
+                deleted=deleted,
+                duration_s=duration,
+                error=f"KG 联动失败: {e}",
+                kg_status="error",
+            )
+
+    # 10. 原子更新 manifest
     manifest[name] = {
         "doc_id": new_doc_id,
         "sha256": sha,
@@ -425,18 +550,20 @@ def sync_source(
         "mtime": mtime,
         "chunk_count": inserted,
         "chunk_ids": ids[:inserted],
+        "embedding_model": Config.EMBEDDING_MODEL_ID,  # B.4：记录本次同步使用的 embedding 模型
         "last_status": "ok",
         "last_sync_ts": time.time(),
     }
     save_manifest_atomic(manifest, manifest_path)
 
-    # 9. 审计
+    # 11. 审计
     duration = time.time() - start_ts
     event = "sync_rebuild" if rebuild else "sync_insert"
     _emit_audit(event, name, new_doc_id,
-                inserted=inserted, deleted=deleted, duration_s=round(duration, 2))
+                inserted=inserted, deleted=deleted, kg_status=kg_status,
+                duration_s=round(duration, 2))
 
-    # 10. 失效缓存（非 rebuild 模式；rebuild 已在步骤 6 失效过）
+    # 12. 失效缓存（非 rebuild 模式；rebuild 已在步骤 6 失效过）
     if not rebuild:
         from utils.tools_config import (
             invalidate_qa_cache,
@@ -448,7 +575,8 @@ def sync_source(
             invalidate_qa_cache()
 
     logger.info(
-        f"[{name}] 完成，inserted={inserted}, deleted={deleted}, duration={duration:.1f}s"
+        f"[{name}] 完成，inserted={inserted}, deleted={deleted}, "
+        f"kg_status={kg_status or 'n/a'}, duration={duration:.1f}s"
     )
     return SyncResult(
         source=name,
@@ -458,6 +586,7 @@ def sync_source(
         inserted=inserted,
         deleted=deleted,
         duration_s=duration,
+        kg_status=kg_status,
     )
 
 
@@ -473,10 +602,16 @@ def sync_all(
 ) -> list[SyncResult]:
     """串行同步所有 source（进程锁由调用方 acquire_sync_lock 包裹）。
 
-    review 补强 #2：可在此处加"无 doc_id 旧 chunk 护栏" — 检测 manifest 为空但
-    collection 已有大量无 doc_id chunk 时，提示先 --migrate。当前默认不强制（让
-    --migrate 显式触发），由文档上线顺序约束保证。
+    B.5：同步开始前自动检测 drug_contraindications.json 变更，有变化则失效药物缓存。
     """
+    # B.5：检测药物禁忌文件变更
+    try:
+        from utils.tools_config import check_drug_contra_changes
+        if check_drug_contra_changes():
+            _emit_audit("drug_cache_invalidated", "drug_contraindications", "")
+    except Exception as e:
+        logger.warning(f"药物禁忌文件变更检测失败: {e}")
+
     results = []
     for source in sources:
         try:
@@ -603,3 +738,64 @@ def run_migration(
             "last_sync_ts": time.time(),
         }
         save_manifest_atomic(manifest, manifest_path)
+
+
+def run_embedding_migration(
+    collections: list[str] | None = None,
+    model_id: str | None = None,
+) -> None:
+    """B.4：给存量无 embedding_model 字段的 chunks 补上标记（不重 embed）。
+
+    推断规则：
+    - source == "chinese_medical_dialogue" → "dashscope-text-embedding-v1"（始终用 dashscope）
+    - 其它 source → 用当前 Config.EMBEDDING_MODEL_ID
+    """
+    import chromadb
+
+    if model_id is None:
+        model_id = Config.EMBEDDING_MODEL_ID
+    if collections is None:
+        collections = [Config.CHROMADB_COLLECTION_NAME, Config.CHROMADB_QA_COLLECTION_NAME]
+
+    client = chromadb.PersistentClient(path=Config.CHROMADB_DIRECTORY)
+    _LEGACY_MODEL = "dashscope-text-embedding-v1"
+
+    for col_name in collections:
+        try:
+            col = client.get_collection(col_name)
+        except Exception as e:
+            logger.warning(f"[embedding_migration] {col_name} 不存在，跳过: {e}")
+            continue
+
+        raw = col.get(include=["metadatas"])
+        all_ids = raw.get("ids", [])
+        all_metas = raw.get("metadatas", [])
+
+        targets = []
+        for cid, meta in zip(all_ids, all_metas):
+            meta = meta or {}
+            if "embedding_model" in meta:
+                continue
+            new_meta = dict(meta)
+            src = new_meta.get("source", "")
+            new_meta["embedding_model"] = _LEGACY_MODEL if src == "chinese_medical_dialogue" else model_id
+            targets.append((cid, new_meta))
+
+        if not targets:
+            logger.info(f"[embedding_migration] {col_name}: 无需迁移")
+            continue
+
+        batch_size = 1000
+        migrated = 0
+        for i in range(0, len(targets), batch_size):
+            batch = targets[i:i + batch_size]
+            try:
+                col.update(ids=[t[0] for t in batch], metadatas=[t[1] for t in batch])
+                migrated += len(batch)
+                logger.info(f"[embedding_migration] {col_name} 进度 {migrated}/{len(targets)}")
+            except Exception as e:
+                logger.error(f"[embedding_migration] {col_name} 批次失败: {e}")
+                break
+
+        _emit_audit("embedding_migration", col_name, "", migrated_count=migrated, model_id=model_id)
+        logger.info(f"[embedding_migration] {col_name} 完成，{migrated} 条 → embedding_model={model_id}")

@@ -430,8 +430,9 @@ def _consult_one(label: str, question: str, llm_chat, vectorstore) -> str:
         str: 该科室的会诊意见（含可能性 + 依据）。
     """
     try:
-        # 按科室过滤检索：只取该科室 label 下的相似病例
-        docs = vectorstore.similarity_search(question, k=CONSULT_TOP_K, filter={"label": label})
+        # 按科室 + embedding 模型过滤检索：只取该科室 label 下、同模型产生的相似病例
+        docs = vectorstore.similarity_search(question, k=CONSULT_TOP_K,
+                                             filter={"label": label, "embedding_model": Config.EMBEDDING_MODEL_ID})
         context = "\n".join(
             f"- {d.metadata.get('answer', '')[:80]}"
             for d in docs

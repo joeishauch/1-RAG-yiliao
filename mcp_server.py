@@ -59,7 +59,7 @@ def retrieve(query: str) -> str:
 @mcp.tool()
 def medical_qa(query: str) -> str:
     """医学知识问答工具：检索医学知识库，回答疾病/症状/用药/保健等科普类问题。"""
-    docs = _qa_vectorstore.similarity_search(query, k=QA_TOP_K)
+    docs = _qa_vectorstore.similarity_search(query, k=QA_TOP_K, filter={"embedding_model": Config.EMBEDDING_MODEL_ID})
     if not docs:
         return "未检索到相关医学知识。"
     lines = []

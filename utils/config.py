@@ -31,6 +31,7 @@ class Settings(BaseSettings):
     # ---- Embedding 模型独立配置（B.2 备选：本地 bge-m3 替代 dashscope，0 费用）----
     LLM_EMBEDDING_TYPE: str = "deepseek"  # deepseek / zhipu / local_bge
     LOCAL_BGE_MODEL_PATH: str = "D:/ai/xtuner-env/大模型微调项目实战/demo_14/embedding_model/models/BAAI--bge-m3/snapshots/master"
+    EMBEDDING_MODEL_ID: str = "bge-m3-local"  # B.4：写入每个 chunk metadata，用于检索时过滤同模型 chunks
 
     # ---- Chroma 向量库 ----
     CHROMADB_DIRECTORY: str = "chromaDB"
@@ -38,7 +39,10 @@ class Settings(BaseSettings):
     CHROMADB_QA_COLLECTION_NAME: str = "medical_qa"    # 科普问答兜底（百科/知识图谱/好大夫）
 
     # ---- 知识图谱（GraphRAG 多跳推理）----
+    KG_SOURCE_PATH: str = "input/huatuo_knowledge_graph_qa/train_datasets.jsonl"
     KG_GRAPH_PATH: str = "kg_graph.pkl"   # build_kg.py 规则切分构建的 medical 图缓存
+    KG_BUILD_SAMPLE: int = 200000         # 图构建抽样规模；0 表示全量
+    KG_SYMPTOM_INDEX_PATH: str = "kg_symptom_index.pkl"
 
     # ---- 药物禁忌（drug_taboo 工具数据源）----
     DRUG_CONTRA_PATH: str = "drug_contraindications.json"   # extract_drug_contra.py 抽取产物，list[{drug_name, contraindications, source}]

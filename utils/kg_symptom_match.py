@@ -12,9 +12,11 @@
 import os
 import pickle
 import threading
+from pathlib import Path
 
 import numpy as np
 
+from utils.config import Config
 from utils.llms import initialize_llm
 from utils import kg_schema as S
 
@@ -23,7 +25,7 @@ SYMPTOM_SIM_THRESHOLD = 0.6
 
 # 症状向量索引磁盘缓存：图症状节点集合不变时直接复用，避免每次启动重建
 # （全图约 1.4 万个症状 × chunk=25 ≈ 556 次 API 请求，首建约 3~4 分钟）
-_INDEX_CACHE_PATH = "kg_symptom_index.pkl"
+_INDEX_CACHE_PATH = Config.KG_SYMPTOM_INDEX_PATH
 
 _embedding = None      # OpenAIEmbeddings 单例
 _index = None          # (症状名列表, L2 归一化向量矩阵) 单例
@@ -55,24 +57,50 @@ def _build_index(G, embedding):
     return names, mat
 
 
+def _source_sha256(G):
+    """读取图缓存携带的源版本；旧图没有版本时返回 None。"""
+    return getattr(G, "graph", {}).get("source_sha256")
+
+
 def _load_or_build_index(G, embedding):
-    """带磁盘缓存的索引构建：图症状节点集合不变时直接复用向量，避免每次启动重建。"""
+    """按源版本和症状节点集合校验磁盘缓存。"""
     names = _collect_symptom_nodes(G)
+    source_sha256 = _source_sha256(G)
     if os.path.exists(_INDEX_CACHE_PATH):
         try:
             with open(_INDEX_CACHE_PATH, "rb") as f:
-                cached_names, mat = pickle.load(f)
-            if cached_names == names:  # 图未变 → 复用缓存
-                return names, mat
+                cached = pickle.load(f)
+            if isinstance(cached, dict):
+                cached_names = cached.get("names")
+                mat = cached.get("matrix")
+                if cached.get("source_sha256") == source_sha256 and cached_names == names:
+                    return names, mat
+            elif isinstance(cached, tuple) and len(cached) == 2:
+                # 旧 tuple 无法证明来源版本，只兼容无版本旧图。
+                cached_names, mat = cached
+                if source_sha256 is None and cached_names == names:
+                    return names, mat
         except Exception:
             pass  # 缓存损坏或不匹配 → 重建
     names, mat = _build_index(G, embedding)
     try:
+        Path(_INDEX_CACHE_PATH).parent.mkdir(parents=True, exist_ok=True)
         with open(_INDEX_CACHE_PATH, "wb") as f:
-            pickle.dump((names, mat), f)
+            pickle.dump({
+                "source_sha256": source_sha256,
+                "names": names,
+                "matrix": mat,
+            }, f)
     except Exception:
         pass  # 缓存写失败不影响功能，下次重建即可
     return names, mat
+
+
+def invalidate_symptom_index():
+    """清空进程内症状索引；磁盘索引由版本校验决定是否懒重建。"""
+    global _index
+    with _lock:
+        _index = None
 
 
 def get_symptom_index(G):

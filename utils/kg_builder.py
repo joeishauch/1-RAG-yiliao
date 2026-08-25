@@ -14,8 +14,11 @@
 import json
 import re
 import logging
+import os
 import pickle
+import tempfile
 from collections import Counter
+from pathlib import Path
 
 import networkx as nx
 
@@ -31,7 +34,41 @@ HEAD_TYPE = {pred: htype for pred, htype, _ttype, _pats in S.RELATION_RULES}
 TAIL_TYPE = {pred: ttype for pred, _htype, ttype, _pats in S.RELATION_RULES}
 
 
-# -------------------- 读取与基础解析 --------------------
+# 图缓存格式版本；Graph 本身仍保持现有 networkx MultiDiGraph 兼容格式。
+GRAPH_SCHEMA_VERSION = 1
+
+
+def normalize_source_path(path):
+    """返回跨平台稳定的源路径表示。"""
+    return os.path.normcase(os.path.abspath(str(path))).replace("\\", "/")
+
+
+def graph_cache_matches(G, source_sha256=None, sample=None, source_path=None):
+    """判断图缓存是否与当前源版本及构建参数匹配。"""
+    if not hasattr(G, "graph"):
+        return False
+    metadata = G.graph
+    if metadata.get("schema_version") != GRAPH_SCHEMA_VERSION:
+        return False
+    if source_sha256 is not None and metadata.get("source_sha256") != source_sha256:
+        return False
+    if metadata.get("sample") != sample:
+        return False
+    if source_path is not None and metadata.get("source_path") != normalize_source_path(source_path):
+        return False
+    return True
+
+
+def _annotate_graph(G, input_path, source_sha256, sample):
+    """给图写入可用于版本校验的来源元数据。"""
+    G.graph.update({
+        "schema_version": GRAPH_SCHEMA_VERSION,
+        "source_sha256": source_sha256,
+        "source_path": normalize_source_path(input_path),
+        "sample": sample,
+    })
+    return G
+
 
 def _read_records(path, sample=None):
     """逐行读 jsonl，返回 (record) 迭代器；sample 限制前 N 条"""
@@ -262,10 +299,23 @@ def build_from_jsonl(input_path, sample=None):
 
 
 def save_graph(G, path):
-    """用标准库 pickle 序列化（networkx 3.6 已移除 gpickle；pickle 对
-    MultiDiGraph + 中文节点 + 简单属性完全保真）。本地自产文件，安全。"""
-    with open(path, "wb") as f:
-        pickle.dump(G, f, protocol=pickle.HIGHEST_PROTOCOL)
+    """原子序列化图缓存，避免进程读到半写入文件。"""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent)
+    )
+    try:
+        with os.fdopen(fd, "wb") as f:
+            pickle.dump(G, f, protocol=pickle.HIGHEST_PROTOCOL)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
     logger.info(f"图已序列化到 {path}")
 
 
@@ -275,16 +325,29 @@ def load_graph(path):
         return pickle.load(f)
 
 
-def build_or_load(input_path, out_path, sample=None, force=False):
-    """有缓存且非 force 直接加载，否则重建并缓存"""
+def build_or_load(input_path, out_path, sample=None, force=False, source_sha256=None):
+    """按源版本加载或重建图；旧的无版本缓存自动视为过期。"""
+    if source_sha256 is None:
+        from doc_sync import streaming_sha256
+        source_sha256 = streaming_sha256(Path(input_path))
+    if sample is not None and sample <= 0:
+        sample = None
+
     if not force and out_path and _path_exists(out_path):
-        return load_graph(out_path)
+        try:
+            cached = load_graph(out_path)
+            if graph_cache_matches(cached, source_sha256, sample, input_path):
+                return cached
+            logger.info("图缓存版本不匹配，开始重建")
+        except Exception as e:
+            logger.warning(f"图缓存读取失败，开始重建: {e}")
+
     G, disease_dict, triples = build_from_jsonl(input_path, sample)
+    _annotate_graph(G, input_path, source_sha256, sample)
     if out_path:
         save_graph(G, out_path)
     return G
 
 
 def _path_exists(path):
-    import os
     return os.path.exists(path)

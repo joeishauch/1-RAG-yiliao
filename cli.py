@@ -302,6 +302,14 @@ def cmd_sync(args):
         print(f"[migrate] 完成：{len(sources)} 个 source 已尝试回填 doc_id")
         return
 
+    # B.4 --migrate-embedding：给存量 chunks 补 embedding_model 字段（不重 embed）
+    if args.migrate_embedding:
+        from doc_sync import run_embedding_migration
+        with acquire_sync_lock():
+            run_embedding_migration()
+        print("[migrate-embedding] 完成：存量 chunks 已补 embedding_model 字段")
+        return
+
     # --once / --watch 循环
     while True:
         with acquire_sync_lock():
@@ -370,6 +378,7 @@ def main():
     p_sync.add_argument("--rebuild", action="store_true", help="强制清空目标 collection 后重建（review 补强 #10：默认排除 demo001）")
     p_sync.add_argument("--include-demo", action="store_true", help="--rebuild 时包含 demo001 子集（默认排除）")
     p_sync.add_argument("--migrate", action="store_true", help="一次性回填 doc_id 给存量无标识 chunk（不重 embed）")
+    p_sync.add_argument("--migrate-embedding", action="store_true", help="B.4：给存量 chunks 补 embedding_model 字段（不重 embed）")
     p_sync.add_argument("--manifest", type=str, default=None, help="自定义 manifest 路径")
     p_sync.add_argument("--watch", action="store_true", help="守护模式：循环执行")
     p_sync.add_argument("--interval", type=int, default=60, help="--watch 间隔秒数（默认 60）")

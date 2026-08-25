@@ -105,7 +105,7 @@ def eval_mode(vectorstore, mode: str):
     details = []
 
     for query, expected_kws in TEST_CASES:
-        docs = vectorstore.similarity_search(query, k=TOP_K)
+        docs = vectorstore.similarity_search(query, k=TOP_K, filter={"embedding_model": Config.EMBEDDING_MODEL_ID})
         rank = None
         retrieved_snippets = []
         for i, d in enumerate(docs):

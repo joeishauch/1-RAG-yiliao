@@ -31,6 +31,13 @@ def get_kg(path):
     return _kg
 
 
+def invalidate_kg_cache():
+    """清空进程内图缓存；下次查询加载同步后的图文件。"""
+    global _kg
+    with _kg_lock:
+        _kg = None
+
+
 def resolve_entity(G, name):
     """把用户输入归一化（去空白 + 别名归一到规范疾病节点）后查图。
 
