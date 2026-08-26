@@ -89,7 +89,7 @@ agent（ReAct，选择工具）──► call_tools（ParallelToolNode 并行执
 .
 ├── main.py                  # FastAPI 服务 + HITL review 端点
 ├── ragAgent.py              # LangGraph 状态图（节点/路由/编译）
-├── cli.py                   # 统一 CLI 入口（chat / serve / ui / eval / mcp）
+├── cli.py                   # 统一 CLI 入口（chat / serve / ui / sync / dedup / eval / mcp）
 ├── mcp_server.py            # 方向1：4 领域工具 → MCP Server（对外提供）
 ├── hospital_mcp_server.py   # 方向2：模拟医院 HIS 的 MCP Server（外部系统）
 ├── mcp_client.py            # 方向2：MCP → LangChain 工具适配器（event loop 桥接）
@@ -107,7 +107,11 @@ agent（ReAct，选择工具）──► call_tools（ParallelToolNode 并行执
 │   ├── safety.py            # 生成前/后规则校验（危险拦截/诊断检测）
 │   └── audit.py             # 审计日志
 ├── prompts/                 # 7 个 prompt 模板（agent/consult/summarize/qa/kg/drug/his）
-├── jsonl2chroma.py          # 数据集导入向量库
+├── jsonl2chroma.py          # 数据集解析、质量门禁、切片与向量导入
+├── doc_sync.py              # 文档变更感知、增量同步、manifest 与跨源去重
+├── dedup.py                 # B.9 确定性跨源精确去重与审计报告
+├── quality_gate.py          # B.8 数据质量门禁与拒绝记录
+├── metrics.py               # B.7 embedding / sync / dedup 指标
 ├── build_kg.py              # 知识图谱构建
 ├── extract_drug_contra.py   # 药物禁忌抽取
 ├── run_label_audit.py       # 标签审核
@@ -151,14 +155,182 @@ python cli.py chat -v                 # 打印节点流转 + 工具调用
 python cli.py serve                   # 启动 API（http://127.0.0.1:8012/docs）
 python cli.py ui                      # 启动患者端（http://127.0.0.1:7860）
 python doctor_ui.py                   # 启动医生审核端（http://127.0.0.1:7861，管理员 admin/admin123）
-python cli.py eval retrieval          # 检索质量评估
-python cli.py eval judge --limit 20   # LLM-as-judge 分诊质量评估
-python cli.py eval e2e                # 端到端四链路回归
-python cli.py mcp                     # 启动 MCP Server（方向1：对外提供 4 领域工具）
-python cli.py mcp --his               # 启动医院 HIS MCP Server（方向2：外部系统 mock）
+python cli.py eval retrieval           # 检索质量评估
+python cli.py eval judge --limit 20    # LLM-as-judge 分诊质量评估
+python cli.py eval e2e                 # 端到端四链路回归
+python cli.py mcp                      # 启动 MCP Server（方向1：对外提供 4 领域工具）
+python cli.py mcp --his                # 启动医院 HIS MCP Server（方向2：外部系统 mock）
 ```
 
-### 2. API 调用（含 HITL 三态）
+### 2. 数据处理命令与产物
+
+数据处理链路统一遵循：
+
+```text
+原始 JSON/JSONL
+    → source parser
+    → 模板/标签清洗
+    → QualityGate 数据质量门禁
+    → 可选按句切片
+    → 可选跨源精确去重
+    → embedding
+    → ChromaDB
+```
+
+> `DEDUP_ENABLED` 默认是 `false`。因此默认导入和同步行为不改变。只有显式开启，并且本次同时处理至少两个 source 时，才会执行跨源去重。去重发生在质量门禁和切片之后、embedding 之前，单位是最终写入 Chroma 的 chunk。
+
+| 命令 / 文件 | 作用 | 是否写 Chroma | 主要 output 产物 |
+|---|---|---:|---|
+| `python jsonl2chroma.py --dry-run` | 解析全部配置 source，预览有效记录和样例，不导入 | 否 | `output/quality_report.json`、`output/rejected_chunks.jsonl` |
+| `python jsonl2chroma.py --source huatuo_lite --limit 200` | 将指定 source 解析、清洗、切片并写入 Chroma | 是 | `output/quality_report.json`、`output/metrics.jsonl` |
+| `python jsonl2chroma.py --clear --source huatuo_lite` | 清空指定目标 collection 后重建导入，适合数据规则变更后的重灌 | 是 | 同上；Chroma 数据位于 `chromaDB/` |
+| `python cli.py sync --dry-run` | 检测源文件变化，预览将删除/写入的 chunk 数，不修改库 | 否 | `output/sync_manifest.json` 不应改变；质量报告会更新 |
+| `python cli.py sync --source huatuo_encyclopedia` | 按 manifest 做变更感知同步；变化时 doc 级删除旧 chunk 后重建 | 是 | `output/sync_manifest.json`、`output/audit.jsonl`、`output/metrics.jsonl` |
+| `python cli.py sync --watch --interval 60` | 守护模式定期执行变更检测和同步 | 可能 | 同步 manifest、审计和指标文件 |
+| `python cli.py sync --migrate` | 为存量向量补写 `doc_id`，不重新 embedding | 仅更新 metadata | `output/sync_manifest.json`、`output/audit.jsonl` |
+| `python cli.py sync --migrate-embedding` | 为存量 chunk 补写 `embedding_model` 标识，不重新 embedding | 仅更新 metadata | `output/audit.jsonl` |
+| `python cli.py dedup --sources a,b --dry-run --limit 200` | 扫描多个 source，预览跨源精确去重结果 | 否 | `output/dedup_report.json`、`output/dedup_dropped.jsonl` |
+| `python verify_b8_quality_gate.py` | 验证 B.8 质量门禁规则和原子报告 | 否 | 终端 `B8_QUALITY_GATE_TEST_OK` |
+| `python verify_b9_dedup.py` | 验证 B.9 归一化、score 选择、报告和阈值开关 | 否 | 终端 `B9_DEDUP_TEST_OK` |
+| `python cli.py quality --source huatuo_lite --limit 200` | 单独扫描指定 source 的质量问题，不触库 | 否 | `output/quality_report.json`、拒绝 JSONL |
+| `python cli.py metrics` | 汇总 embedding、sync、collection、dedup 指标 | 否 | 读取 `output/metrics.jsonl` |
+| `python cli.py metrics --diagnose` | 诊断指标中的耗时、快照和去重计数语义 | 否 | 终端诊断信息 |
+
+### 3. B.9 跨源去重用法
+
+#### 3.1 只读预览（面试演示推荐）
+
+```bash
+python cli.py dedup \\
+  --sources huatuo_encyclopedia,huatuo_knowledge_graph \\
+  --dry-run \\
+  --limit 200
+```
+
+该命令会读取两个 source，执行与实际导入相同的 parser、质量门禁和切片逻辑，然后输出：
+
+- `input`：进入去重阶段的 chunk 总数；
+- `kept`：去重后保留的 chunk 数；
+- `dropped`：被判定为重复并丢弃的 chunk 数；
+- `dropped_by_source`：各 source 被丢弃的数量；
+- `output/dedup_report.json`：汇总报告；
+- `output/dedup_dropped.jsonl`：逐条丢弃记录。
+
+该命令**永远是分析模式**，即使不写 `--dry-run` 也不会初始化 embedding、打开 Chroma、删除 collection、写入向量或修改同步 manifest。
+
+#### 3.2 开启实际导入/同步去重
+
+在项目 `.env` 中显式配置：
+
+```ini
+DEDUP_ENABLED=true
+DEDUP_REPORT_PATH=output/dedup_report.json
+DEDUP_DROPPED_PATH=output/dedup_dropped.jsonl
+```
+
+然后同时选择至少两个 source：
+
+```bash
+python cli.py sync \\
+  --source huatuo_encyclopedia \\
+  --source huatuo_knowledge_graph \\
+  --dry-run
+```
+
+确认 dry-run 报告符合预期后，再去掉 `--dry-run` 执行真实同步。真实同步只会将 `kept` chunk 送入 embedding 和 Chroma，`dropped` chunk 不产生向量。
+
+#### 3.3 去重规则
+
+| 规则 | 行为 |
+|---|---|
+| 文本归一化 | Unicode NFKC、大小写 `casefold`、常见中英文标点归一、连续空白折叠、首尾空白清除 |
+| 精确重复 | 归一化后的 document 完全相同才算重复 |
+| score 选择 | score 越高越优先；缺失、非法、NaN、Infinity 按 `0` |
+| 分数相同 | 按 `SOURCES` 顺序和输入顺序保留先出现者 |
+| 空文本 | 不使用空字符串作为去重 key，不把多个空文本错误合并；通常会先被质量门禁拒绝 |
+| collection | 只在同一 collection 内去重；`medical_triage` 与 `medical_qa` 相互隔离 |
+| 结果单位 | chunk，不是原始逻辑 record；因为 chunk 才是最终写入 Chroma 的单位 |
+| 可解释性 | 每条 dropped 记录包含 source、score、normalized hash、`duplicate_of` 和 reason |
+| 模糊相似 | 首版不使用 embedding、SimHash 或语义阈值；相似度扩展留作二期 |
+
+例如百科和知识图谱都写入 `medical_qa` 时，归一化后的相同 chunk 只保留一份；但相同文本若分别属于 `medical_qa` 和 `medical_triage`，两份都会保留，因为两个 collection 服务不同检索链路。
+
+#### 3.4 B.9 output 字段对应
+
+`output/dedup_report.json` 是汇总报告，核心结构如下：
+
+```json
+{
+  "rule_version": "b9-exact-1.0",
+  "collection": "medical_qa",
+  "stats": {
+    "input_total": 400,
+    "kept_total": 398,
+    "dropped_total": 2,
+    "empty_text_kept": 0,
+    "duplicate_groups": 2,
+    "kept_by_source": {
+      "huatuo_encyclopedia": 250,
+      "huatuo_knowledge_graph": 148
+    },
+    "dropped_by_source": {
+      "huatuo_knowledge_graph": 2
+    },
+    "dropped_by_reason": {
+      "lower_score": 2
+    }
+  },
+  "groups": [
+    {
+      "normalized_hash": "...",
+      "member_count": 2,
+      "winner": {
+        "index": 17,
+        "id": "winner-chunk-id",
+        "source": "huatuo_encyclopedia"
+      },
+      "winner_score": 0.0
+    }
+  ]
+}
+```
+
+`output/dedup_dropped.jsonl` 每行对应一个被丢弃 chunk，示例：
+
+```json
+{
+  "source": "huatuo_knowledge_graph",
+  "score": 0.0,
+  "winner_score": 0.0,
+  "record_index": 217,
+  "id": "dropped-chunk-id",
+  "normalized_hash": "...",
+  "duplicate_of": {
+    "index": 17,
+    "id": "winner-chunk-id",
+    "source": "huatuo_encyclopedia"
+  },
+  "reason": "tie_first_seen"
+}
+```
+
+这里的 `duplicate_of` 表示该条数据最终对应的保留项；`reason` 为 `lower_score` 或 `tie_first_seen`。报告和丢弃明细不保存完整医疗文本，使用 hash 做审计关联，避免不必要地重复落盘原文。
+
+### 4. 数据处理相关 output 总表
+
+| output 路径 | 生成模块 | 内容 | 是否原子写 |
+|---|---|---|---:|
+| `output/sync_manifest.json` | `doc_sync.py` | 每个 source 的文件 sha256、size、doc_id、chunk 数、chunk IDs、embedding 模型和最后状态 | 是（临时文件 + `os.replace`） |
+| `output/quality_report.json` | `quality_gate.py` | 质量门禁规则版本、accepted/rejected、拒绝原因分布 | 是（临时文件 + `os.replace`） |
+| `output/rejected_chunks.jsonl` | `quality_gate.py` | 质量门禁拒绝的 source、索引、原因和样本文本 | 否，带锁追加 |
+| `output/dedup_report.json` | `dedup.py` | B.9 去重总量、source/collection 分布、重复组和 winner | 是（临时文件 + `os.replace`） |
+| `output/dedup_dropped.jsonl` | `dedup.py` | 每条 dropped 的 source、score、hash、winner 标识和 reason | 追加 |
+| `output/metrics.jsonl` | `metrics.py` | embedding、sync、collection size、dedup 和审计事件指标 | 追加 |
+| `output/audit.jsonl` | `utils/audit.py` | sync、dedup、质量/业务审计事件 | 带锁追加 |
+| `chromaDB/` | ChromaDB | 实际向量、正文和 metadata | 向量库内部管理 |
+
+> `output/` 和 `chromaDB/` 已加入 `.gitignore`，这些是运行时产物，不应提交到 Git；面试展示时可以展示 JSON 结构、终端指标和报告截图，不需要提交数据集或向量二进制。
+
 
 **第 1 步：发问诊请求**（高风险触发待审核）
 
@@ -222,7 +394,31 @@ curl http://127.0.0.1:8012/v1/chat/review \
 
 ---
 
-## 🧪 测试与验证
+### 5. 数据处理方案验收结论
+
+截至当前版本，数据处理方案的 **A 主线 + B.2～B.9 补强项已完成**，可以作为面试中的完整工程化数据处理方案进行介绍：
+
+- A：源文件变更感知、文件指纹、`doc_id`、doc 级删除重建、manifest、锁和 webhook 触发；
+- B.2：按句切片、overlap、chunk 追踪和本地 `bge-m3` embedding；
+- B.3：知识图谱缓存与向量同步、版本校验和 KG 产物失效；
+- B.4：embedding 模型标记、模型迁移和维度不兼容治理；
+- B.5：药物禁忌文件变更检测与缓存失效；
+- B.6：ChromaDB 快照、恢复和过期备份清理；
+- B.7：embedding、同步、collection size、审计和去重指标；
+- B.8：结构、长度、metadata、标签和模板题质量门禁，拒绝记录与质量报告；
+- B.9：同 collection 内跨 source 精确去重、score 择优、丢弃审计和预览 CLI。
+
+面试演示建议使用不修改数据库的命令：
+
+```bash
+python verify_b8_quality_gate.py
+python verify_b9_dedup.py
+python cli.py dedup --sources huatuo_encyclopedia,huatuo_knowledge_graph --dry-run --limit 200
+python cli.py metrics --diagnose
+```
+
+> B.9 默认关闭，真实启用需要在 `.env` 设置 `DEDUP_ENABLED=true`。面试场景不必为了展示而重灌全量向量库；展示 verifier、dry-run 报告、metrics 和审计设计即可。全量重建属于上线运维动作，应先备份并使用隔离 collection 做小批量验证。
+
 
 - `verify_*.py`：各模块独立验证（KG / 症状匹配 / 科普 / 用药 / 标签均衡），不依赖 PostgreSQL。
 - `verify_mcp.py`：MCP 双方向集成验证（方向1 连自建 server 调 retrieve + 方向2 bind HIS 工具看 LLM 调 query_registration）。

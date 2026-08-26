@@ -26,6 +26,7 @@ import os
 import sys
 import time
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional
@@ -50,6 +51,7 @@ class SyncResult:
     duration_s: float
     error: Optional[str] = None
     kg_status: Optional[str] = None
+    dedup_dropped: int = 0
 
 
 # ==================== 工具函数 ====================
@@ -282,6 +284,9 @@ def sync_source(
     rebuild: bool = False,
     manifest_path: str | None = None,
     include_demo: bool = False,
+    _prepared_records: list[dict] | None = None,
+    _dedup_dropped: int = 0,
+    _rebuild_collection_deleted: bool = False,
 ) -> SyncResult:
     """同步单个 source。
 
@@ -302,10 +307,12 @@ def sync_source(
     )
     import chromadb
 
-    start_ts = time.time()
+    start_ts = time.monotonic()
+    dedup_dropped = _dedup_dropped
     name = source["name"]
     file_path = Path(source["file"])
     collection_name = override_collection or source["collection"]
+    metric_context = {"source": name, "collection": collection_name}
 
     # 1. 算 file_size / mtime / sha256 / new_doc_id
     try:
@@ -315,9 +322,18 @@ def sync_source(
         sha = streaming_sha256(file_path)
         new_doc_id = compute_doc_id(file_path, file_size)
     except OSError as e:
+        duration = time.monotonic() - start_ts
+        try:
+            from metrics import record_sync_done
+            record_sync_done(
+                name, "error", duration, collection=collection_name,
+                context=metric_context,
+            )
+        except Exception as metric_error:
+            logger.warning(f"记录 stat/read 失败 metrics 失败: {metric_error}")
         return SyncResult(
             source=name, status="error", doc_id="", prev_doc_id=None,
-            inserted=0, deleted=0, duration_s=time.time() - start_ts,
+            inserted=0, deleted=0, duration_s=duration,
             error=f"stat/read 源文件失败: {e}",
         )
 
@@ -346,90 +362,200 @@ def sync_source(
             except Exception as e:
                 logger.warning(f"[{name}] 源未变化但 KG 修复失败: {e}")
 
-        duration = time.time() - start_ts
+        duration = time.monotonic() - start_ts
         _emit_audit("sync_skip", name, new_doc_id,
                     kg_status=kg_status, duration_s=round(duration, 2))
+        try:
+            from metrics import record_sync_done
+            record_sync_done(
+                name, "skipped", duration, collection=collection_name,
+                context=metric_context, deleted_scope="none",
+            )
+        except Exception as metric_error:
+            logger.warning(f"记录 skip metrics 失败: {metric_error}")
         logger.info(f"[{name}] 无变化（sha256+size+chunk_count 全匹配），跳过")
         return SyncResult(
             source=name, status="skipped", doc_id=new_doc_id,
             prev_doc_id=prev.get("doc_id"), inserted=0, deleted=0,
             duration_s=duration, kg_status=kg_status,
+            dedup_dropped=dedup_dropped,
         )
 
     # 4. 取 prev_doc_id
     prev_doc_id = prev.get("doc_id")
 
     # 5. 跑 parser 生成 documents / metadatas / ids
-    per_label_limit = source.get("per_label_limit")
-    override_limit = source.get("limit")
-    balanced = bool(per_label_limit) and override_limit is None
-    if balanced:
-        records_iter = _balanced_parsed(source, per_label_limit)
-        limit = None
+    dedup_dropped = _dedup_dropped
+    if _prepared_records is not None:
+        prepared = list(_prepared_records)
+        documents = [row["document"] for row in prepared]
+        metadatas = [row["metadata"] for row in prepared]
+        ids = [row["id"] for row in prepared]
+        count = len(prepared)
+        records_processed = count
     else:
-        records_iter = _read_records(source)
-        limit = override_limit
-
-    documents, metadatas, ids = [], [], []
-    count = 0
-    records_processed = 0  # B.2 fix: limit 按 records 数（不是 chunks 数）
-    for item in records_iter:
-        if limit is not None and records_processed >= limit:
-            break
-        parsed = item if balanced else _parse_valid(source, item)
-        if parsed is None:
-            continue
-        document = parsed["document"].strip()
-        # B.2 切片：CHUNKING_ENABLED 时按句切分，否则按 MAX_DOC_LEN 硬截断
-        # 与 jsonl2chroma 行为一致，保证"导入"和"同步"行为对齐
-        if Config.CHUNKING_ENABLED and len(document) > Config.CHUNK_SIZE:
-            from chunking import chunk_text
-            text_chunks = chunk_text(
-                document,
-                chunk_size=Config.CHUNK_SIZE,
-                overlap=Config.CHUNK_OVERLAP,
-                min_size=Config.CHUNK_MIN_SIZE,
-            )
-        elif len(document) > MAX_DOC_LEN:
-            from chunking import Chunk
-            text_chunks = [Chunk(text=document[:MAX_DOC_LEN], sentence_count=1)]
+        # 现有单 source 路径保持原有解析与切片行为。
+        per_label_limit = source.get("per_label_limit")
+        override_limit = source.get("limit")
+        balanced = bool(per_label_limit) and override_limit is None
+        if balanced:
+            records_iter = _balanced_parsed(source, per_label_limit)
+            limit = None
         else:
-            from chunking import Chunk
-            text_chunks = [Chunk(text=document, sentence_count=1)]
-        records_processed += 1  # B.2 fix: 成功解析后 +1
+            records_iter = _read_records(source)
+            limit = override_limit
 
-        for tc in text_chunks:
-            meta = dict(parsed["metadata"])
-            meta["doc_id"] = new_doc_id
-            meta.setdefault("source", name)
-            meta["sentence_count"] = tc.sentence_count  # B.2：每 chunk 句子数
-            meta["embedding_model"] = Config.EMBEDDING_MODEL_ID  # B.4：标记产生该向量的 embedding 模型
-            documents.append(tc.text)
-            metadatas.append({k: v for k, v in meta.items() if v is not None})
-            ids.append(uuid.uuid4().hex)
-            count += 1
+        documents, metadatas, ids = [], [], []
+        count = 0
+        records_processed = 0  # B.2 fix: limit 按 records 数（不是 chunks 数）
+        for item in records_iter:
+            if limit is not None and records_processed >= limit:
+                break
+            parsed = item if balanced else _parse_valid(source, item)
+            if parsed is None:
+                continue
+            document = parsed["document"].strip()
+            # B.2 切片：CHUNKING_ENABLED 时按句切分，否则按 MAX_DOC_LEN 硬截断
+            # 与 jsonl2chroma 行为一致，保证"导入"和"同步"行为对齐
+            if Config.CHUNKING_ENABLED and len(document) > Config.CHUNK_SIZE:
+                from chunking import chunk_text
+                text_chunks = chunk_text(
+                    document,
+                    chunk_size=Config.CHUNK_SIZE,
+                    overlap=Config.CHUNK_OVERLAP,
+                    min_size=Config.CHUNK_MIN_SIZE,
+                )
+            elif len(document) > MAX_DOC_LEN:
+                from chunking import Chunk
+                text_chunks = [Chunk(text=document[:MAX_DOC_LEN], sentence_count=1)]
+            else:
+                from chunking import Chunk
+                text_chunks = [Chunk(text=document, sentence_count=1)]
+            records_processed += 1
+
+            for tc in text_chunks:
+                meta = dict(parsed["metadata"])
+                meta["doc_id"] = new_doc_id
+                meta.setdefault("source", name)
+                meta["sentence_count"] = tc.sentence_count
+                meta["embedding_model"] = Config.EMBEDDING_MODEL_ID
+                documents.append(tc.text)
+                metadatas.append({k: v for k, v in meta.items() if v is not None})
+                ids.append(uuid.uuid4().hex)
+                count += 1
 
     logger.info(f"[{name}] 解析完成，有效记录 {count} 条")
 
     if dry_run:
-        duration = time.time() - start_ts
+        duration = time.monotonic() - start_ts
         estimated_delete = prev.get("chunk_count", 0) if prev_doc_id else 0
         _emit_audit("sync_dry_run", name, new_doc_id,
                     inserted=count, deleted=estimated_delete,
                     duration_s=round(duration, 2))
+        try:
+            from metrics import record_sync_done
+            record_sync_done(
+                name, "dry_run", duration, inserted=count,
+                deleted=estimated_delete, collection=collection_name,
+                context=metric_context,
+                deleted_scope="doc_id" if prev_doc_id else "none",
+                deleted_estimated=bool(prev_doc_id),
+            )
+        except Exception as metric_error:
+            logger.warning(f"记录 dry-run metrics 失败: {metric_error}")
+        # B.8：dry-run 也跑质量门禁，仅记录不阻断（不删库不 embed）
+        try:
+            from quality_gate import QualityGate
+            gate = QualityGate(name)
+            gate_records = [
+                {"document": doc, "metadata": meta}
+                for doc, meta in zip(documents, metadatas)
+            ]
+            gate.check_batch(gate_records, doc_id=new_doc_id)
+            gate.write_report(extra={"dry_run": True, "original_records": count})
+            logger.info(
+                f"[{name}] [dry-run] gate: accepted={gate.stats.accepted}, "
+                f"rejected={gate.stats.rejected} rate={gate.stats.rejection_rate:.2%}"
+            )
+        except Exception as gate_error:
+            logger.warning(f"质量门禁 dry-run 失败（不影响主流程）: {gate_error}")
         logger.info(f"[{name}] [dry-run] would insert={count}, delete={estimated_delete}")
         return SyncResult(
             source=name, status="ok", doc_id=new_doc_id,
             prev_doc_id=prev_doc_id, inserted=count, deleted=estimated_delete,
-            duration_s=duration,
+            duration_s=duration, dedup_dropped=dedup_dropped,
         )
 
-    # 6. 删除旧 chunks（review 补强 #1 首次保护 + #4 rebuild 顺序 + #10 demo 默认排除）
+    if _dedup_dropped:
+        # sync_all may pass filtered Chroma-ready arrays; preserve the count in
+        # this source result and never regenerate IDs after deduplication.
+        dedup_dropped = _dedup_dropped
+    # B.8：删除旧库前必须先跑质量门禁；拒绝率超阈值时不删，保护现有可用库。
+    gate = None
+    if Config.QUALITY_GATE_ENABLED:
+        try:
+            from quality_gate import QualityGate, is_within_rate_limit
+            gate = QualityGate(name)
+            # 重新跑一次 parser 把 records_iter 转为 parsed 列表喂给 gate。
+            # 注意：records_iter 可能已被均衡抽样耗尽，这里直接复用已解析的 documents。
+            gate_records = [
+                {"document": doc, "metadata": meta}
+                for doc, meta in zip(documents, metadatas)
+            ]
+            accepted_records = gate.check_batch(gate_records, doc_id=new_doc_id)
+            gate.write_report(extra={"phase": "pre_delete", "rebuild": rebuild})
+            logger.info(
+                f"[{name}] gate: accepted={gate.stats.accepted}, "
+                f"rejected={gate.stats.rejected} rate={gate.stats.rejection_rate:.2%}"
+            )
+            if (
+                Config.QUALITY_GATE_FAIL_ON_THRESHOLD
+                and not is_within_rate_limit(
+                    gate.stats, Config.QUALITY_GATE_MAX_REJECTION_RATE
+                )
+            ):
+                duration = time.monotonic() - start_ts
+                _emit_audit(
+                    "gate_blocked", name, new_doc_id,
+                    rejected=gate.stats.rejected,
+                    accepted=gate.stats.accepted,
+                    rejection_rate=gate.stats.rejection_rate,
+                    threshold=Config.QUALITY_GATE_MAX_REJECTION_RATE,
+                    duration_s=round(duration, 2),
+                )
+                try:
+                    from metrics import record_sync_done
+                    record_sync_done(
+                        name, "gate_blocked", duration,
+                        collection=collection_name, context=metric_context,
+                    )
+                except Exception:
+                    pass
+                return SyncResult(
+                    source=name, status="gate_blocked", doc_id=new_doc_id,
+                    prev_doc_id=prev_doc_id,
+                    inserted=0, deleted=0,
+                    duration_s=duration,
+                    error=f"质量门禁拒绝率 {gate.stats.rejection_rate:.2%} "
+                          f"超阈值 {Config.QUALITY_GATE_MAX_REJECTION_RATE:.2%}",
+                    dedup_dropped=dedup_dropped,
+                )
+            # 用 accepted 列表替换原 documents/metadatas/ids（同步下游）
+            documents = [r["document"] for r in accepted_records]
+            metadatas = [r["metadata"] for r in accepted_records]
+            ids = ids[: len(documents)]
+        except Exception as e:
+            logger.warning(f"质量门禁异常，按原数据继续: {e}")
+            gate = None
     client = chromadb.PersistentClient(path=Config.CHROMADB_DIRECTORY)
     deleted = 0
 
     try:
-        if rebuild:
+        if _rebuild_collection_deleted:
+            # Aggregate sync already invalidated/deleted the shared collection.
+            collection = client.get_or_create_collection(name=collection_name)
+            deleted = 0
+        elif rebuild:
             # review 补强 #4：硬性顺序 — 失效旧缓存 → delete_collection → get_or_create
             from utils.tools_config import (
                 invalidate_qa_cache,
@@ -464,13 +590,24 @@ def sync_source(
                         except Exception as e2:
                             logger.error(f"[{name}] 回退 chunk_ids 删除也失败: {e2}")
     except Exception as e:
-        duration = time.time() - start_ts
+        duration = time.monotonic() - start_ts
         _emit_audit("sync_error", name, new_doc_id,
                     error=str(e), duration_s=round(duration, 2))
+        try:
+            from metrics import record_sync_done
+            record_sync_done(
+                name, "error", duration, deleted=deleted,
+                collection=collection_name, context=metric_context,
+                deleted_scope="collection" if rebuild else "doc_id",
+                deleted_estimated=not rebuild,
+            )
+        except Exception as metric_error:
+            logger.warning(f"记录 delete 失败 metrics 失败: {metric_error}")
         return SyncResult(
             source=name, status="error", doc_id=new_doc_id,
             prev_doc_id=prev_doc_id, inserted=0, deleted=deleted,
             duration_s=duration, error=f"delete 阶段异常: {e}",
+            dedup_dropped=dedup_dropped,
         )
 
     # 7. 写入新 chunks
@@ -481,7 +618,14 @@ def sync_source(
             batch_docs = documents[i:i + Config.SYNC_BATCH_SIZE]
             batch_meta = metadatas[i:i + Config.SYNC_BATCH_SIZE]
             batch_ids = ids[i:i + Config.SYNC_BATCH_SIZE]
-            batch_vecs = llm_embedding.embed_documents(batch_docs)
+            # B.7：记录 embedding 耗时与成本
+            from metrics import time_embedding
+            with time_embedding(
+                Config.EMBEDDING_MODEL_ID,
+                batch_docs,
+                context={**metric_context, "batch_items": len(batch_docs)},
+            ):
+                batch_vecs = llm_embedding.embed_documents(batch_docs)
             collection.add(
                 embeddings=batch_vecs,
                 documents=batch_docs,
@@ -491,14 +635,23 @@ def sync_source(
             inserted += len(batch_docs)
             logger.info(f"[{name}] 已灌入 {inserted}/{len(documents)}")
     except Exception as e:
-        duration = time.time() - start_ts
+        duration = time.monotonic() - start_ts
         _emit_audit("sync_error", name, new_doc_id,
                     error=str(e), inserted=inserted, deleted=deleted,
                     duration_s=round(duration, 2))
+        # B.7：记录 sync 失败指标
+        from metrics import record_sync_done
+        record_sync_done(
+            name, "error", duration, inserted=inserted, deleted=deleted,
+            collection=collection_name, context=metric_context,
+            deleted_scope="collection" if rebuild else "doc_id",
+            deleted_estimated=not rebuild,
+        )
         return SyncResult(
             source=name, status="error", doc_id=new_doc_id,
             prev_doc_id=prev_doc_id, inserted=inserted, deleted=deleted,
             duration_s=duration, error=f"add 阶段异常: {e}",
+            dedup_dropped=dedup_dropped,
         )
 
     # 9. KG 联动：只有向量写入成功后才更新同源图缓存。
@@ -518,7 +671,7 @@ def sync_source(
                 duration_s=kg_info["duration_s"],
             )
         except Exception as e:
-            duration = time.time() - start_ts
+            duration = time.monotonic() - start_ts
             _emit_audit(
                 "sync_error",
                 name,
@@ -530,6 +683,20 @@ def sync_source(
                 duration_s=round(duration, 2),
             )
             logger.exception(f"[{name}] 向量已写入，但 KG 联动失败")
+            try:
+                from metrics import record_sync_done
+                record_sync_done(
+                    name, "error", duration, inserted=inserted,
+                    deleted=deleted, collection=collection_name,
+                context={**metric_context, "kg_status": "error", "dedup_dropped": dedup_dropped},
+                )
+            except Exception as metric_error:
+                logger.warning(f"记录 KG 失败 metrics 失败: {metric_error}")
+            try:
+                from metrics import record_collection_size
+                record_collection_size(collection_name, collection.count(), context=metric_context)
+            except Exception as metric_error:
+                logger.warning(f"记录 KG 失败后的 collection snapshot 失败: {metric_error}")
             return SyncResult(
                 source=name,
                 status="error",
@@ -540,6 +707,7 @@ def sync_source(
                 duration_s=duration,
                 error=f"KG 联动失败: {e}",
                 kg_status="error",
+                dedup_dropped=dedup_dropped,
             )
 
     # 10. 原子更新 manifest
@@ -557,7 +725,7 @@ def sync_source(
     save_manifest_atomic(manifest, manifest_path)
 
     # 11. 审计
-    duration = time.time() - start_ts
+    duration = time.monotonic() - start_ts
     event = "sync_rebuild" if rebuild else "sync_insert"
     _emit_audit(event, name, new_doc_id,
                 inserted=inserted, deleted=deleted, kg_status=kg_status,
@@ -578,6 +746,20 @@ def sync_source(
         f"[{name}] 完成，inserted={inserted}, deleted={deleted}, "
         f"kg_status={kg_status or 'n/a'}, duration={duration:.1f}s"
     )
+    # B.7：记录 sync 完成事件 + collection 大小
+    try:
+        from metrics import record_sync_done, record_collection_size
+        record_sync_done(
+            name, "ok", duration, inserted=inserted, deleted=deleted,
+            collection=collection_name, context=metric_context,
+            deleted_scope="collection" if rebuild else "doc_id",
+            deleted_estimated=not rebuild and bool(prev_doc_id),
+            deleted_known=not rebuild or bool(prev_doc_id),
+        )
+        record_collection_size(collection_name, collection.count(), context=metric_context)
+    except Exception as e:
+        logger.warning(f"记录 sync metrics 失败（不影响主流程）: {e}")
+
     return SyncResult(
         source=name,
         status="rebuilt" if rebuild else "ok",
@@ -587,6 +769,7 @@ def sync_source(
         deleted=deleted,
         duration_s=duration,
         kg_status=kg_status,
+        dedup_dropped=dedup_dropped,
     )
 
 
@@ -611,6 +794,13 @@ def sync_all(
             _emit_audit("drug_cache_invalidated", "drug_contraindications", "")
     except Exception as e:
         logger.warning(f"药物禁忌文件变更检测失败: {e}")
+
+    if Config.DEDUP_ENABLED and len({s["name"] for s in sources}) >= 2:
+        return _run_sync_all_dedup(
+            sources, llm_embedding, dry_run=dry_run,
+            override_collection=override_collection, rebuild=rebuild,
+            manifest_path=manifest_path, include_demo=include_demo,
+        )
 
     results = []
     for source in sources:
@@ -638,8 +828,245 @@ def sync_all(
                 duration_s=0.0,
                 error=f"未捕获: {type(e).__name__}: {e}",
             )
+            try:
+                from metrics import record_sync_done
+                source_name = source.get("name", "?")
+                record_sync_done(
+                    source_name, "error", 0.0,
+                    collection=override_collection or source.get("collection"),
+                    context={"source": source_name, "uncaught": True},
+                )
+            except Exception as metric_error:
+                logger.warning(f"记录 outer sync 失败 metrics 失败: {metric_error}")
         results.append(result)
     return results
+
+
+def _dedup_pending_sources(pending, *, report_path=None, dropped_path=None):
+    """Deduplicate prepared source chunks by collection before any writes."""
+    from dedup import dedup_and_write
+
+    all_rows = [row for item in pending for row in item["records"]]
+    if not all_rows:
+        return 0
+    kept_by_id = {}
+    dropped_by_source = Counter()
+    kept_by_source = Counter()
+    report_path = report_path or Config.DEDUP_REPORT_PATH
+    dropped_path = dropped_path or Config.DEDUP_DROPPED_PATH
+    # One aggregate report/log per sync call; dedup_records scopes keys by the
+    # collection carried by each candidate, preventing cross-collection merging.
+    result = dedup_and_write(
+        all_rows,
+        report_path=report_path,
+        dropped_path=dropped_path,
+        context={"path": "doc_sync", "scope": "pending_sources"},
+    )
+    for row in result.kept:
+        kept_by_id[row.get("id")] = row
+    kept_by_source.update(result.stats.get("kept_by_source", {}))
+    dropped_by_source.update(result.stats.get("dropped_by_source", {}))
+    for item in pending:
+        kept = [row for row in item["records"] if row.get("id") in kept_by_id]
+        item["records"] = kept
+        item["documents"] = [row["document"] for row in kept]
+        item["metadatas"] = [row["metadata"] for row in kept]
+        item["ids"] = [row["id"] for row in kept]
+        item["dedup_dropped"] = sum(
+            1 for row in all_rows
+            if row.get("source") == item["source"]["name"] and row.get("id") not in kept_by_id
+        )
+    try:
+        from metrics import record_dedup_done
+        record_dedup_done(
+            kept_by_source=dict(kept_by_source),
+            dropped_by_source=dict(dropped_by_source),
+            context={"path": "doc_sync", "scope": "pending_sources"},
+        )
+    except Exception as e:
+        logger.warning(f"记录 doc_sync 去重 metrics 失败: {e}")
+    _emit_audit(
+        "dedup", "multiple", "",
+        input=len(all_rows), kept=len(kept_by_id),
+        dropped=result.dropped_count, report_path=report_path,
+    )
+    return result.dropped_count
+
+
+def _prepare_sync_b9(source, *, manifest_path=None, override_collection=None,
+                      rebuild=False):
+    """Build sync candidates without embedding/deleting; used by aggregate B.9."""
+    from jsonl2chroma import _balanced_parsed, _parse_valid, _read_records, MAX_DOC_LEN
+    from quality_gate import QualityGate, is_within_rate_limit
+
+    name = source["name"]
+    file_path = Path(source["file"])
+    collection_name = override_collection or source["collection"]
+    try:
+        stat = file_path.stat()
+        file_size, mtime = stat.st_size, stat.st_mtime
+        sha = streaming_sha256(file_path)
+        new_doc_id = compute_doc_id(file_path, file_size)
+    except OSError as e:
+        return {"source": source, "error": f"stat/read 源文件失败: {e}"}
+
+    prev = load_manifest(manifest_path).get(name, {})
+    if (
+        not rebuild
+        and prev.get("sha256") == sha
+        and prev.get("file_size") == file_size
+        and prev.get("last_status") == "ok"
+        and prev.get("chunk_count", 0) > 0
+        and prev.get("embedding_model") == Config.EMBEDDING_MODEL_ID
+    ):
+        return {"source": source, "skipped": True}
+
+    per_label_limit = source.get("per_label_limit")
+    balanced = bool(per_label_limit) and source.get("limit") is None
+    records_iter = _balanced_parsed(source, per_label_limit) if balanced else _read_records(source)
+    limit = None if balanced else source.get("limit")
+    candidates = []
+    records_processed = 0
+    for item in records_iter:
+        if limit is not None and records_processed >= limit:
+            break
+        parsed = item if balanced else _parse_valid(source, item)
+        if parsed is None:
+            continue
+        document = parsed["document"].strip()
+        if Config.CHUNKING_ENABLED and len(document) > Config.CHUNK_SIZE:
+            from chunking import chunk_text
+            chunks = chunk_text(document, chunk_size=Config.CHUNK_SIZE,
+                                overlap=Config.CHUNK_OVERLAP, min_size=Config.CHUNK_MIN_SIZE)
+        elif len(document) > MAX_DOC_LEN:
+            from chunking import Chunk
+            chunks = [Chunk(text=document[:MAX_DOC_LEN], sentence_count=1)]
+        else:
+            from chunking import Chunk
+            chunks = [Chunk(text=document, sentence_count=1)]
+        records_processed += 1
+        for chunk_index, chunk in enumerate(chunks):
+            meta = {k: v for k, v in dict(parsed["metadata"]).items() if v is not None}
+            meta["doc_id"] = new_doc_id
+            meta.setdefault("source", name)
+            meta["sentence_count"] = chunk.sentence_count
+            meta["embedding_model"] = Config.EMBEDDING_MODEL_ID
+            candidates.append({
+                "document": chunk.text,
+                "metadata": meta,
+                "source": name,
+                "score": meta.get("score", 0),
+                "collection": collection_name,
+                "id": uuid.uuid4().hex,
+                "record_index": records_processed - 1,
+                "chunk_index": chunk_index,
+            })
+
+    gate = QualityGate(name)
+    accepted = candidates
+    if Config.QUALITY_GATE_ENABLED:
+        accepted = gate.check_batch(
+            [{"document": row["document"], "metadata": row["metadata"]} for row in candidates],
+            doc_id=new_doc_id,
+        )
+        # QualityGate returns parsed copies; match by document+metadata while
+        # retaining the original candidate IDs for manifest/write alignment.
+        accepted_keys = {(row["document"], repr(row["metadata"])) for row in accepted}
+        accepted = [row for row in candidates
+                    if (row["document"], repr(row["metadata"])) in accepted_keys]
+        gate.write_report(extra={"phase": "pre_dedup", "source": name})
+        if Config.QUALITY_GATE_FAIL_ON_THRESHOLD and not is_within_rate_limit(
+            gate.stats, Config.QUALITY_GATE_MAX_REJECTION_RATE
+        ):
+            return {
+                "source": source,
+                "gate_blocked": True,
+                "doc_id": new_doc_id,
+                "prev": prev,
+                "error": f"质量门禁拒绝率 {gate.stats.rejection_rate:.2%} 超阈值",
+            }
+
+    return {
+        "source": source,
+        "skipped": False,
+        "doc_id": new_doc_id,
+        "prev": prev,
+        "file_size": file_size,
+        "mtime": mtime,
+        "sha": sha,
+        "collection": collection_name,
+        "records": accepted,
+        "documents": [row["document"] for row in accepted],
+        "metadatas": [row["metadata"] for row in accepted],
+        "ids": [row["id"] for row in accepted],
+        "dedup_dropped": 0,
+    }
+
+
+def _run_sync_all_dedup(sources, llm_embedding, *, dry_run, override_collection,
+                        rebuild, manifest_path, include_demo):
+    """Two-phase multi-source sync: prepare, dedup by collection, then commit."""
+    prepared = []
+    results = {}
+    for source in sources:
+        item = _prepare_sync_b9(
+            source, manifest_path=manifest_path,
+            override_collection=override_collection, rebuild=rebuild,
+        )
+        if item.get("skipped"):
+            results[source["name"]] = sync_source(
+                source, llm_embedding, dry_run=dry_run,
+                override_collection=override_collection, rebuild=rebuild,
+                manifest_path=manifest_path, include_demo=include_demo,
+            )
+        elif item.get("error") or item.get("gate_blocked"):
+            results[source["name"]] = SyncResult(
+                source=source["name"],
+                status="gate_blocked" if item.get("gate_blocked") else "error",
+                doc_id=item.get("doc_id", ""), prev_doc_id=item.get("prev", {}).get("doc_id"),
+                inserted=0, deleted=0, duration_s=0.0, error=item.get("error"),
+            )
+        else:
+            prepared.append(item)
+
+    pending_names = {item["source"]["name"] for item in prepared}
+    if len(pending_names) >= 2:
+        _dedup_pending_sources(prepared)
+
+    deleted_collections = set()
+    if rebuild and not dry_run and prepared:
+        import chromadb
+        client = chromadb.PersistentClient(path=Config.CHROMADB_DIRECTORY)
+        for item in prepared:
+            collection_name = item["collection"]
+            if collection_name in deleted_collections:
+                continue
+            from utils.tools_config import invalidate_qa_cache, invalidate_triage_cache
+            if collection_name == Config.CHROMADB_COLLECTION_NAME:
+                invalidate_triage_cache()
+            elif collection_name == Config.CHROMADB_QA_COLLECTION_NAME:
+                invalidate_qa_cache()
+            try:
+                client.delete_collection(collection_name)
+            except Exception as e:
+                logger.info(f"[{collection_name}] aggregate rebuild 删除跳过: {e}")
+            deleted_collections.add(collection_name)
+
+    for item in prepared:
+        source = item["source"]
+        results[source["name"]] = sync_source(
+            source,
+            llm_embedding,
+            dry_run=dry_run,
+            override_collection=override_collection,
+            rebuild=rebuild,
+            manifest_path=manifest_path,
+            include_demo=include_demo,
+            _prepared_records=item["records"],
+            _dedup_dropped=item.get("dedup_dropped", 0),
+            _rebuild_collection_deleted=(rebuild and not dry_run),
+        )
+    return [results[source["name"]] for source in sources]
 
 
 def run_migration(

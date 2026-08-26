@@ -19,6 +19,7 @@ import json
 import uuid
 import logging
 import argparse
+from collections import defaultdict
 
 import chromadb
 
@@ -233,10 +234,13 @@ def _balanced_parsed(source, per_label_limit):
 
 # -------------------- 灌库逻辑 --------------------
 
-def import_source(source, llm_embedding, dry_run=False, override_limit=None, override_collection=None):
+def _import_source_legacy(source, llm_embedding, dry_run=False, override_limit=None, override_collection=None):
     """把单个数据源灌入 ChromaDB"""
+    import time
     name = source["name"]
     collection_name = override_collection if override_collection else source["collection"]
+    start_ts = time.monotonic()
+    metric_context = {"source": name, "collection": collection_name, "path": "jsonl2chroma"}
 
     # 均衡抽样（分诊源专用）：每科上限 per_label_limit；用 --limit 覆盖时退回 head 截断
     per_label_limit = source.get("per_label_limit")
@@ -254,6 +258,10 @@ def import_source(source, llm_embedding, dry_run=False, override_limit=None, ove
     count = 0
     records_processed = 0  # B.2 fix: limit 按 records 数（不是 chunks 数）
 
+    # B.8：确定性质量门禁（仅本路径；doc_sync 走 QualityGate 共享同一规则）
+    from quality_gate import QualityGate
+    gate = QualityGate(name)
+
     # 同步方案 A.4：所有 chunk 统一打 doc_id（路径+大小规范化），doc_sync.py 用它做"doc 级全删全重建"
     # 这里计算一次，循环里 setdefault；老库无 doc_id 用 --migrate 回填
     from pathlib import Path as _Path
@@ -269,6 +277,10 @@ def import_source(source, llm_embedding, dry_run=False, override_limit=None, ove
         if parsed is None:
             continue
         document = parsed["document"].strip()
+        # B.8：先过确定性质量门禁；拒绝项不进入 embedding/入库
+        accepted, _reason = gate.check_record(parsed, index=records_processed)
+        if not accepted:
+            continue
         # B.2 切片：CHUNKING_ENABLED 时按句切分，否则按 MAX_DOC_LEN 硬截断
         if Config.CHUNKING_ENABLED and len(document) > Config.CHUNK_SIZE:
             from chunking import chunk_text
@@ -295,8 +307,9 @@ def import_source(source, llm_embedding, dry_run=False, override_limit=None, ove
             metadatas.append(meta)
             ids.append(str(uuid.uuid4()))
             count += 1
-
-    logger.info(f"[{name}] 解析完成，有效记录 {count} 条")
+            gate.stats.accepted += 1
+    logger.info(f"[{name}] 解析完成，有效记录 {count} 条；质量门禁 accepted={gate.stats.accepted} rejected={gate.stats.rejected}")
+    gate.write_report(extra={"path": "jsonl2chroma"})
 
     if dry_run:
         logger.info(f"[{name}] [dry-run] 前 2 条样例：")
@@ -314,7 +327,13 @@ def import_source(source, llm_embedding, dry_run=False, override_limit=None, ove
         batch_docs = documents[i:i + BATCH_SIZE]
         batch_meta = metadatas[i:i + BATCH_SIZE]
         batch_ids = ids[i:i + BATCH_SIZE]
-        batch_vecs = llm_embedding.embed_documents(batch_docs)
+        from metrics import time_embedding
+        with time_embedding(
+            Config.EMBEDDING_MODEL_ID,
+            batch_docs,
+            context={**metric_context, "batch_items": len(batch_docs)},
+        ):
+            batch_vecs = llm_embedding.embed_documents(batch_docs)
         collection.add(
             embeddings=batch_vecs,
             documents=batch_docs,
@@ -323,8 +342,177 @@ def import_source(source, llm_embedding, dry_run=False, override_limit=None, ove
         )
         logger.info(f"[{name}] 已灌入 {min(i + BATCH_SIZE, len(documents))}/{len(documents)}")
 
-    logger.info(f"[{name}] 完成，collection「{collection_name}」当前总量 {collection.count()} 条")
+    duration = time.monotonic() - start_ts
+    try:
+        from metrics import record_sync_done, record_collection_size
+        record_sync_done(
+            name, "ok", duration, inserted=count, deleted=0,
+            collection=collection_name, context=metric_context,
+            deleted_scope="none",
+        )
+        record_collection_size(collection_name, collection.count(), context=metric_context)
+    except Exception as e:
+        logger.warning(f"记录 import metrics 失败（不影响主流程）: {e}")
     return count
+# -------------------- 批量导入（B.9 聚合入口） --------------------
+
+def _collect_source_candidates(source, override_limit=None, override_collection=None):
+    """Prepare Chroma-ready chunks without embedding or database access."""
+    from pathlib import Path as _Path
+    from doc_sync import compute_doc_id as _compute_doc_id
+    from quality_gate import QualityGate
+
+    name = source["name"]
+    collection_name = override_collection or source["collection"]
+    per_label_limit = source.get("per_label_limit")
+    balanced = bool(per_label_limit) and override_limit is None
+    records_iter = (
+        _balanced_parsed(source, per_label_limit) if balanced else _read_records(source)
+    )
+    limit = None if balanced else (
+        override_limit if override_limit is not None else source.get("limit")
+    )
+    file_path = _Path(source["file"])
+    doc_id = _compute_doc_id(file_path, file_path.stat().st_size)
+    gate = QualityGate(name)
+    candidates = []
+    records_processed = 0
+    for item in records_iter:
+        if limit is not None and records_processed >= limit:
+            break
+        parsed = item if balanced else _parse_valid(source, item)
+        if parsed is None:
+            continue
+        document = parsed["document"].strip()
+        accepted, _ = gate.check_record(parsed, index=records_processed, doc_id=doc_id)
+        if not accepted:
+            gate.stats.rejected += 1
+            continue
+        if Config.CHUNKING_ENABLED and len(document) > Config.CHUNK_SIZE:
+            from chunking import chunk_text
+            chunks = chunk_text(document, chunk_size=Config.CHUNK_SIZE,
+                                overlap=Config.CHUNK_OVERLAP, min_size=Config.CHUNK_MIN_SIZE)
+        elif len(document) > MAX_DOC_LEN:
+            from chunking import Chunk
+            chunks = [Chunk(text=document[:MAX_DOC_LEN], sentence_count=1)]
+        else:
+            from chunking import Chunk
+            chunks = [Chunk(text=document, sentence_count=1)]
+        records_processed += 1
+        for chunk_index, chunk in enumerate(chunks):
+            metadata = _clean_metadata(parsed["metadata"])
+            metadata["doc_id"] = doc_id
+            metadata["sentence_count"] = chunk.sentence_count
+            metadata["embedding_model"] = Config.EMBEDDING_MODEL_ID
+            candidates.append({
+                "document": chunk.text,
+                "metadata": metadata,
+                "source": name,
+                "score": metadata.get("score", 0),
+                "collection": collection_name,
+                "id": uuid.uuid4().hex,
+                "record_index": records_processed - 1,
+                "chunk_index": chunk_index,
+            })
+            gate.stats.accepted += 1
+    gate.write_report(extra={"path": "jsonl2chroma", "dedup_candidates": len(candidates)})
+    return candidates
+
+
+def _record_dedup_metrics(result, context):
+    from metrics import record_dedup_done
+    record_dedup_done(
+        kept_by_source=result.stats.get("kept_by_source", {}),
+        dropped_by_source=result.stats.get("dropped_by_source", {}),
+        context=context,
+    )
+
+
+def _write_candidates(candidates, llm_embedding, dry_run, collection_name, source_name):
+    """Embed and write one source/collection group; dry-run performs no writes."""
+    if dry_run:
+        return len(candidates)
+    client = chromadb.PersistentClient(path=CHROMADB_DIRECTORY)
+    collection = client.get_or_create_collection(name=collection_name)
+    for i in range(0, len(candidates), BATCH_SIZE):
+        batch = candidates[i:i + BATCH_SIZE]
+        docs = [r["document"] for r in batch]
+        with __import__("metrics").time_embedding(
+            Config.EMBEDDING_MODEL_ID, docs,
+            context={"source": source_name, "collection": collection_name,
+                     "path": "jsonl2chroma", "batch_items": len(docs)},
+        ):
+            vectors = llm_embedding.embed_documents(docs)
+        collection.add(
+            embeddings=vectors,
+            documents=docs,
+            metadatas=[r["metadata"] for r in batch],
+            ids=[r["id"] for r in batch],
+        )
+    return len(candidates)
+
+
+def import_sources(sources, llm_embedding=None, *, dry_run=False,
+                   override_limit=None, override_collection=None):
+    """Import selected sources, optionally applying collection-scoped B.9 dedup."""
+    candidates_by_source = []
+    for source in sources:
+        candidates_by_source.append((source, _collect_source_candidates(
+            source, override_limit, override_collection)))
+    active = Config.DEDUP_ENABLED and len({s["name"] for s, _ in candidates_by_source}) >= 2
+    all_candidates = [r for _, rows in candidates_by_source for r in rows]
+    kept_by_collection = defaultdict(list)
+    dropped_total = 0
+    if active:
+        from dedup import dedup_and_write
+        result = dedup_and_write(
+            all_candidates,
+            report_path=Config.DEDUP_REPORT_PATH,
+            dropped_path=Config.DEDUP_DROPPED_PATH,
+            context={
+                "path": "jsonl2chroma",
+                "sources": [s["name"] for s, _ in candidates_by_source],
+                "scope": "collection",
+            },
+        )
+        _record_dedup_metrics(result, {"path": "jsonl2chroma", "scope": "collection"})
+        for row in result.kept:
+            kept_by_collection[row["collection"]].append(row)
+        dropped_total = result.dropped_count
+        try:
+            from utils.audit import build_record, write_audit
+            write_audit(build_record(
+                event="dedup",
+                thread_id="import::dedup",
+                user_id="jsonl2chroma",
+                comment=json.dumps({
+                    "sources": [s["name"] for s, _ in candidates_by_source],
+                    "input": result.input_count,
+                    "kept": result.kept_count,
+                    "dropped": result.dropped_count,
+                    "report_path": Config.DEDUP_REPORT_PATH,
+                }, ensure_ascii=False),
+            ))
+        except Exception as e:
+            logger.warning(f"去重审计写入失败（不影响主流程）: {e}")
+    else:
+        for row in all_candidates:
+            kept_by_collection[row["collection"]].append(row)
+
+    total = 0
+    for source, _ in candidates_by_source:
+        name = source["name"]
+        collection_name = override_collection or source["collection"]
+        rows = [r for r in kept_by_collection[collection_name] if r["source"] == name]
+        total += _write_candidates(rows, llm_embedding, dry_run, collection_name, name)
+    logger.info("批量处理完成：input=%s kept=%s dropped=%s%s", len(all_candidates), total,
+                dropped_total, "（dry-run，未灌库）" if dry_run else "")
+    return total
+
+
+def import_source(source, llm_embedding, dry_run=False, override_limit=None, override_collection=None):
+    """Compatibility wrapper; single-source calls intentionally bypass cross-source dedup."""
+    return _import_source_legacy(source, llm_embedding, dry_run, override_limit, override_collection)
 
 
 def main():
@@ -360,9 +548,18 @@ def main():
                 logger.info(f"collection「{cname}」不存在，跳过清空")
 
     total = 0
-    for source in sources:
-        total += import_source(source, llm_embedding, dry_run=args.dry_run,
-                               override_limit=args.limit, override_collection=args.collection)
+    if Config.DEDUP_ENABLED and len({s["name"] for s in sources}) >= 2:
+        total = import_sources(
+            sources,
+            llm_embedding,
+            dry_run=args.dry_run,
+            override_limit=args.limit,
+            override_collection=args.collection,
+        )
+    else:
+        for source in sources:
+            total += import_source(source, llm_embedding, dry_run=args.dry_run,
+                                   override_limit=args.limit, override_collection=args.collection)
 
     logger.info(f"全部处理完成，共 {total} 条记录" + ("（dry-run，未灌库）" if args.dry_run else ""))
 

@@ -109,6 +109,20 @@ class Settings(BaseSettings):
     SYNC_LOCK_PATH: str = "output/sync.lock"        # 进程级文件锁路径
     SYNC_STALE_LOCK_SECS: int = 1800        # 锁文件 mtime > 30 分钟视为 stale，强制解锁重试
 
+    # ---- B.8 数据质量门禁 ----
+    QUALITY_GATE_ENABLED: bool = True                 # 默认开；.env 设 false 关闭
+    QUALITY_GATE_MAX_REJECTION_RATE: float = 0.5      # 拒绝率上限；超过则终止本次 sync
+    QUALITY_GATE_FAIL_ON_THRESHOLD: bool = True       # 拒绝率超阈值时是否阻断 sync（false=仅记录告警）
+    QUALITY_REJECTED_PATH: str = "output/rejected_chunks.jsonl"
+    QUALITY_REPORT_PATH: str = "output/quality_report.json"
+
+    # ---- B.9 跨源精确去重 ----
+    # 默认关闭；仅在显式开启且一次处理至少两个 source 时生效。
+    DEDUP_ENABLED: bool = False
+    DEDUP_REPORT_PATH: str = "output/dedup_report.json"
+    DEDUP_DROPPED_PATH: str = "output/dedup_dropped.jsonl"
+    DEDUP_RULE_VERSION: str = "b9-exact-1.0"
+
 
 # 全局单例：模块 import 时即加载 .env 与环境变量
 settings = Settings()
