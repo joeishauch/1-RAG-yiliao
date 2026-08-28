@@ -198,7 +198,7 @@ python cli.py mcp --his                # 启动医院 HIS MCP Server（方向2�
 
 ### 3. 跨源去重用法
 
-#### 3.1 只读预览（面试演示推荐）
+#### 3.1 只读预览（推荐）
 
 ```bash
 python cli.py dedup \\
@@ -329,7 +329,7 @@ python cli.py sync \\
 | `output/audit.jsonl` | `utils/audit.py` | sync、dedup、质量/业务审计事件 | 带锁追加 |
 | `chromaDB/` | ChromaDB | 实际向量、正文和 metadata | 向量库内部管理 |
 
-> `output/` 和 `chromaDB/` 已加入 `.gitignore`，这些是运行时产物，不应提交到 Git；面试展示时可以展示 JSON 结构、终端指标和报告截图，不需要提交数据集或向量二进制。
+> `output/` 和 `chromaDB/` 已加入 `.gitignore`，这些是运行时产物，不应提交到 Git；展示时可以展示 JSON 结构、终端指标和报告截图，不需要提交数据集或向量二进制。
 
 
 **第 1 步：发问诊请求**（高风险触发待审核）
@@ -396,7 +396,7 @@ curl http://127.0.0.1:8012/v1/chat/review \
 
 ### 5. 数据处理方案验收结论
 
-截至当前版本，数据处理方案的核心链路与工程化补强能力已完成，可以作为面试中的完整数据处理方案进行介绍：
+截至当前版本，数据处理方案的核心链路与工程化补强能力已完成，可以作为完整的数据处理方案进行介绍：
 
 - 源文件变更感知、文件指纹、`doc_id`、doc 级删除重建、manifest、锁和 webhook 触发；
 - 按句切片、overlap、chunk 追踪和本地 `bge-m3` embedding；
@@ -408,7 +408,7 @@ curl http://127.0.0.1:8012/v1/chat/review \
 - 结构、长度、metadata、标签和模板题质量门禁，拒绝记录与质量报告；
 - 同 collection 内跨 source 精确去重、score 择优、丢弃审计和预览 CLI。
 
-面试演示建议使用不修改数据库的命令：
+建议使用不修改数据库的命令：
 
 ```bash
 python verify_b8_quality_gate.py
@@ -417,7 +417,7 @@ python cli.py dedup --sources huatuo_encyclopedia,huatuo_knowledge_graph --dry-r
 python cli.py metrics --diagnose
 ```
 
-> `DEDUP_ENABLED` 默认关闭，真实启用需要在 `.env` 设置 `DEDUP_ENABLED=true`。面试场景不必为了展示而重灌全量向量库；展示 verifier、dry-run 报告、metrics 和审计设计即可。全量重建属于上线运维动作，应先备份并使用隔离 collection 做小批量验证。
+> 真实启用需要在 `.env` 设置 `DEDUP_ENABLED=true`。不必为了展示而重灌全量向量库；可以直接展示 verifier、dry-run 报告、metrics 和审计设计。全量重建属于上线运维动作，应先备份并使用隔离 collection 做小批量验证。
 
 
 - `verify_*.py`：各模块独立验证（KG / 症状匹配 / 科普 / 用药 / 标签均衡），不依赖 PostgreSQL。
